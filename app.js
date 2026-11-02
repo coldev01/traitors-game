@@ -5,7 +5,7 @@ const SUPABASE_ANON_KEY = 'YOUR-ANON-KEY';
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const app = document.getElementById('app');
 const S = { user: null, admin: false, game: null, me: null, players: [], roles: {}, events: [], results: {},
-            messages: [], mine: {}, picks: {}, overview: null, tab: 'game', error: '' };
+            messages: [], mine: {}, picks: {}, overview: null, tab: 'game', error: '', creds: [] };
 
 // Display names come from Google profiles, so every interpolated value goes through esc().
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -112,18 +112,23 @@ function gmPanel() {
   const evs = o.events.map(e => `<p>${esc(e.kind)} — ${esc(e.status)}, closes ${countdown(e.closes_at)}
     <button class="ghost" data-act="close" data-ev="${esc(e.id)}">Close now</button>
     <button class="ghost" data-act="extend" data-ev="${esc(e.id)}">+1 day</button></p>`).join('');
-  return `<div class="card"><h3>Game master</h3><p class="muted">${o.players} players joined</p>${S.game.status === 'active' ? evs : ''}
+  const add = S.game.status !== 'lobby' ? '' : `<p class="muted">${o.names.map(esc).join(', ') || 'No players yet'}</p>
+    <div class="row"><input id="pname" placeholder="Name"><input id="pemail" type="email" placeholder="Email">
+    <button data-act="addplayer">Add player</button></div>
+    ${S.creds.length ? `<p class="muted">Copy these now, passwords aren't shown again:</p>${S.creds.map(c => `<p><code>${esc(c.email)} / ${esc(c.password)}</code></p>`).join('')}` : ''}`;
+  return `<div class="card"><h3>Game master</h3><p class="muted">${o.players} players</p>${add}${S.game.status === 'active' ? evs : ''}
     <button class="ghost" data-act="delete">Delete game</button></div>`;
 }
 
 function view() {
-  if (!S.user) return `<h1>Traitors</h1><button data-act="login">Sign in with Google</button>`;
+  if (!S.user) return `<h1>Traitors</h1><div class="row"><input id="email" type="email" placeholder="Email" autocomplete="username">
+    <input id="pw" type="password" placeholder="Password" autocomplete="current-password"><button data-act="login">Sign in</button></div>`;
   const g = S.game;
   if (!g) return S.admin ? `<button data-act="create">Create game</button>` : `<p>No game yet — check back soon.</p>`;
   if (g.status === 'lobby') {
     if (S.admin) return `<h2>Lobby</h2>${gmPanel()}<button data-act="start">Start game</button>`;
     return S.me ? `<h2>Lobby</h2><p class="muted">Waiting for the game master to start.</p>${playerGrid()}`
-                : `<h2>A game is open</h2><button data-act="join">Join game</button>`;
+                : `<p>You haven't been added to this game yet — ask the game master.</p>`;
   }
   if (g.status === 'finished') {
     return `<h1>${g.winner === 'faithful' ? 'The Faithful win' : 'The Traitors win'}</h1>${playerGrid()}<h2>What happened</h2>${history()}${S.admin ? gmPanel() : ''}${S.admin ? '<button data-act="create">New game</button>' : ''}`;
@@ -160,10 +165,21 @@ function tick() {
 
 const sel = id => document.getElementById('sel-' + id).value || null;
 const actions = {
-  login: () => sb.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: location.origin + location.pathname } }),
+  login: async () => {
+    const { error } = await sb.auth.signInWithPassword({ email: document.getElementById('email').value.trim(), password: document.getElementById('pw').value });
+    S.error = error?.message ?? '';
+    await refresh();
+  },
+  addplayer: async () => {
+    const name = document.getElementById('pname').value.trim(), email = document.getElementById('pemail').value.trim();
+    if (!name || !email) return;
+    const { data, error } = await sb.functions.invoke('create-player', { body: { game_id: S.game.id, name, email } });
+    S.error = error ? (await error.context?.json?.().catch(() => null))?.error ?? error.message : '';
+    if (data?.password) { S.creds.push(data); document.getElementById('pname').value = document.getElementById('pemail').value = ''; }
+    await refresh();
+  },
   logout: () => sb.auth.signOut().then(refresh),
   create: () => call('create_game'),
-  join: () => call('join_game', { p_game: S.game.id }),
   start: () => call('start_game', { p_game: S.game.id }),
   vote: el => call('cast_vote', { p_event: el.dataset.ev, p_target: sel(el.dataset.ev) }),
   murder: el => call('pick_victim', { p_event: el.dataset.ev, p_target: sel(el.dataset.ev) }),
@@ -183,7 +199,9 @@ document.addEventListener('click', e => {
   const el = e.target.closest('[data-act]');
   if (el) actions[el.dataset.act](el);
 });
-document.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.id === 'chat') actions.send(); });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter') ({ chat: actions.send, pw: actions.login })[e.target.id]?.();
+});
 
 sb.auth.onAuthStateChange(() => setTimeout(refresh, 0));
 // An open <select> is closed by a re-render, so don't poll over someone mid-choice.

@@ -4,12 +4,12 @@
 
 1. New project. Database → Extensions → enable `pg_cron`.
 2. SQL editor: run `db/schema.sql`, then the seed (org domain, GM email) at its bottom.
-3. Authentication → Providers → Google: add a Google OAuth client (Google Cloud Console → Credentials → Web client). Authorised redirect URI is the one Supabase shows on that page.
-4. Authentication → URL Configuration: Site URL and Redirect URLs = your Pages URL (`https://<user>.github.io/<repo>/`) plus `http://localhost:8000/` for local testing.
+3. Authentication → Providers: leave Email enabled, no change needed (players are created pre-confirmed). Add the GM account yourself: Authentication → Users → Add user (email + password), then put that email in the `admins` seed.
+4. Deploy the add-player function (it holds the service-role key server-side, never in the repo): `supabase functions deploy create-player` (or paste `supabase/functions/create-player/index.ts` into Edge Functions → New function in the dashboard). Leave "Verify JWT" on.
 5. On a scratch project only, run `db/tests.sql`. It should end with `all tests passed`.
 6. Project Settings → API: copy the URL and anon key into the top of `app.js`. The anon key is meant to be public; never put the service_role key anywhere in the repo.
 
-Org-domain restriction lives in `join_game` (checks the email domain against the seed), so non-org Google accounts can sign in but cannot join.
+There is no self-sign-up: the GM adds players in the lobby (name + email) and the app shows each generated password once to hand out. `join_game` and the `org_domain` seed are no longer used by the client.
 
 ## 2. Headshots
 
@@ -23,7 +23,7 @@ Local check first: `python3 -m http.server 8000` and open `http://localhost:8000
 
 ## 4. Dry run (compressed schedule)
 
-Needs 6 players (the minimum): use 6 test Google accounts on the org domain plus the GM account. `start_game` checks the caller is the GM, so it can't run from the dashboard SQL editor. Instead, once the players have joined, sign in as the GM and run this in the browser console (the GM Start button uses the real weekly schedule):
+Needs 6 players (the minimum): add 6 test players in the GM lobby panel plus the GM account. `start_game` checks the caller is the GM, so it can't run from the dashboard SQL editor. Instead, once the players are added, sign in as the GM and run this in the browser console (the GM Start button uses the real weekly schedule):
 
 ```js
 await sb.rpc('start_game', {

@@ -378,6 +378,7 @@ begin
   if not is_admin() then raise exception 'admin only'; end if;
   return jsonb_build_object(
     'players', (select count(*) from players where game_id = p_game),
+    'names', coalesce((select jsonb_agg(display_name order by display_name) from players where game_id = p_game), '[]'),
     'events', coalesce((select jsonb_agg(to_jsonb(e) order by e.opens_at)
                         from (select * from events where game_id = p_game and status <> 'revealed'
                               order by opens_at limit 8) e), '[]'));
