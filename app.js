@@ -5,7 +5,7 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const app = document.getElementById('app');
 const S = { user: null, admin: false, game: null, me: null, players: [], roles: {}, events: [], results: {},
-            messages: [], mine: {}, picks: {}, overview: null, dash: null, secrets: null, gmchat: [], curtain: false, person: null, gallery: [], picking: false, skipPhoto: false, gmPick: null, lobbyStep: 'players', tab: 'game', error: '', notice: '', authTab: 'signin', peek: false, offer: null, recovery: false, voting: null, voteSel: null, voteKind: 'kill' };
+            messages: [], mine: {}, picks: {}, overview: null, dash: null, secrets: null, gmchat: [], curtain: false, person: null, gallery: [], picking: false, skipPhoto: false, gmPick: null, lobbyStep: 'players', tab: 'game', error: '', notice: '', authTab: 'signin', peek: false, archived: [], archiveData: {}, openArchive: null, offer: null, recovery: false, voting: null, voteSel: null, voteKind: 'kill' };
 
 // Display names come from Google profiles, so every interpolated value goes through esc().
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -18,11 +18,12 @@ async function refresh() {
   S.user = session?.user ?? null;
   if (S.user) {
     S.admin = (await sb.rpc('am_admin')).data === true;
+    if (S.admin) S.archived = (await sb.from('games').select('*, players(count)').eq('archived', true).order('created_at', { ascending: false })).data ?? [];
     if (!S.admin) {
       S.person = (await sb.rpc('my_person')).data ?? null;
       if (S.person && (!S.person.avatar_key || S.picking)) S.gallery = (await sb.rpc('photo_gallery')).data ?? [];
     }
-    const { data } = await sb.from('games').select('*').order('created_at', { ascending: false }).limit(1);
+    const { data } = await sb.from('games').select('*').eq('archived', false).order('created_at', { ascending: false }).limit(1);
     S.game = data?.[0] ?? null;
     if (S.game) await loadGame();
   }
@@ -77,7 +78,7 @@ function pickerView() {
   const changing = S.person.avatar_key && S.picking;
   const tiles = S.gallery.map(g => `<button class="pick-photo ${g.mine ? 'mine' : ''}" data-act="photo" data-key="${esc(g.key)}"
     ${g.taken ? 'disabled' : ''} aria-label="Photo ${esc(g.key)}${g.taken ? ', already taken' : ''}"><img src="avatars/${esc(g.key)}.webp" alt=""></button>`).join('');
-  const fields = changing ? `<div class="edit-fields"><label>Name<input id="ename" maxlength="40" value="${esc(S.person.display_name)}" autocomplete="off"></label>
+  const fields = changing ? `<div class="edit-fields"><label>Name<input id="ename" maxlength="40" value="${esc(S.person.name)}" autocomplete="off"></label>
       <label>New password<input id="epw" type="password" placeholder="Leave blank to keep yours" autocomplete="new-password"></label></div>
     <div class="gm-actions"><button data-act="savemine">Save</button></div>` : '';
   return `<h2 style="margin-top:0">${changing ? 'Edit your details' : 'Choose your photo'}</h2>
@@ -89,13 +90,75 @@ function pickerView() {
       : !S.gallery.some(g => !g.taken) ? '<div class="gm-actions"><button data-act="skipphoto">Continue with my initial</button></div>' : ''}`;
 }
 
+const murderedIds = () => new Set(S.events.filter(e => e.kind === 'murder' && e.status === 'revealed' && S.results[e.id]?.kind === 'kill').map(e => S.results[e.id].target));
+
+// The finished game: the winning side in full, with a burst of confetti the first time it is shown.
+function winnerHero() {
+  const g = S.game, traitors = g.winner === 'traitors';
+  const team = S.players.filter(p => (S.roles[p.id] === 'traitor') === traitors && S.roles[p.id]);
+  const names = team.map(p => esc(p.display_name));
+  const who = names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names.slice(-1)}` : names[0] ?? '';
+  const line = traitors ? `The traitors were ${who}. They fooled everyone.` : `${who} found every traitor.`;
+  return `<div class="winner ${esc(g.winner)}"><p class="muted">The game is over</p><h1>${traitors ? 'The Traitors win' : 'The Faithful win'}</h1>
+    <div class="winners">${team.map(p => `<span class="winface">${avatar(p)}<span class="pname">${esc(p.display_name)}</span></span>`).join('')}</div>
+    <p>${line}</p></div>`;
+}
+
+function confetti() {
+  if (S.celebrated || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  S.celebrated = true;
+  const colours = ['#ff8200', '#ff6685', '#f1dfae', '#730032'];
+  for (let i = 0; i < 70; i++) {
+    const c = document.createElement('i');
+    c.className = 'confetti';
+    c.style.cssText = `left:${Math.random() * 100}vw;background:${colours[i % 4]};animation-delay:${Math.random() * 1.5}s;animation-duration:${2.5 + Math.random() * 2}s`;
+    document.body.append(c);
+    setTimeout(() => c.remove(), 6500);
+  }
+}
+
+// An archived game is shown with the same screens as a live finished one, by pointing the globals at its data for the render.
+async function fetchGame(id) {
+  const [pl, ro, ev, re] = await Promise.all([
+    sb.from('players').select('*').eq('game_id', id).order('display_name'),
+    sb.from('roles').select('*').eq('game_id', id),
+    sb.from('events').select('*').eq('game_id', id).order('opens_at'),
+    sb.from('event_results').select('*').eq('game_id', id)]);
+  return {
+    players: pl.data ?? [],
+    roles: Object.fromEntries((ro.data ?? []).map(r => [r.player_id, r.role])),
+    events: ev.data ?? [],
+    results: Object.fromEntries((re.data ?? []).map(r => [r.event_id, { target: r.target_id, kind: r.kind, accepted: r.accepted, votes: r.votes }]))
+  };
+}
+
+function archivedGameView(g) {
+  const d = S.archiveData[g.id];
+  if (!d) return '<p class="muted">Loading…</p>';
+  const keep = { game: S.game, players: S.players, roles: S.roles, events: S.events, results: S.results, me: S.me };
+  Object.assign(S, { game: g, ...d, me: null });
+  try { return `${winnerHero()}${playerGrid()}<h3>What happened</h3>${timeline(Infinity)}`; } finally { Object.assign(S, keep); }
+}
+
+function archivedList() {
+  if (!S.archived.length) return '';
+  const items = S.archived.map(g => {
+    const open = S.openArchive === g.id;
+    return `<li><button class="archrow" data-act="archiveopen" data-id="${esc(g.id)}" aria-expanded="${open}">
+      <span><b>${g.winner === 'traitors' ? 'The Traitors won' : g.winner === 'faithful' ? 'The Faithful won' : 'Not finished'}</b>
+      <span class="muted">${new Date(g.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}, ${g.players?.[0]?.count ?? 0} players</span></span>
+      <span class="caret">${open ? 'Hide' : 'Show'}</span></button>${open ? `<div class="archbody">${archivedGameView(g)}</div>` : ''}</li>`;
+  }).join('');
+  return `<h2>Archived games</h2><ul class="archive">${items}</ul>`;
+}
+
 function playerGrid() {
   const mineTraitor = S.me && S.roles[S.me.id] === 'traitor';
-  const murdered = new Set(S.events.filter(e => e.kind === 'murder' && e.status === 'revealed' && S.results[e.id]?.kind === 'kill').map(e => S.results[e.id].target));
+  const murdered = murderedIds();
   return `<div class="grid">${S.players.map(p => {
     const role = S.roles[p.id];
     // Our own role and fellow traitors only show while the sealed role card is open, so a glance at the grid gives nothing away.
-    const tag = role && (!p.alive || S.game.status === 'finished' || ((p.id === S.me?.id || mineTraitor) && (S.peek || !S.me?.alive)))
+    const tag = role && (!p.alive || p.revealed || S.game.status === 'finished' || ((p.id === S.me?.id || mineTraitor) && (S.peek || !S.me?.alive)))
       ? `<span class="tag ${role}">${role}</span>` : '';
     return `<div class="player ${p.alive ? '' : 'dead'}"><span class="avwrap">${avatar(p)}${murdered.has(p.id) ? '<img class="slain" src="assets/murdered.svg" alt="Murdered">' : ''}</span><span class="pname">${esc(p.display_name)}</span><br>${tag}</div>`;
   }).join('')}</div>`;
@@ -113,10 +176,10 @@ function eventPanel(e) {
                           : `<p class="clock">${countdown(e.closes_at)}<small>left to decide</small></p>`;
   if (e.kind === 'endgame') {
     const c = S.endChoice[e.id];
-    const pick = (end, label, cls) => `<button class="${cls}${c === end ? ' active' : ''}" data-act="endgame" data-ev="${esc(e.id)}" data-end="${end}">${label}</button>`;
+    const pick = (end, label) => `<button class="${c === end ? '' : 'ghost'}" data-act="endgame" data-ev="${esc(e.id)}" data-end="${end}">${label}</button>`;
     return `<div class="slip"><h3>The end game</h3>${clock}
       <p>If everyone chooses to end the game, it ends. If no traitor is left, the Faithful win. If any traitor is still here, the Traitors win. One vote to keep playing and it goes on.</p>
-      <div class="row">${pick(true, 'End the game', '')}${pick(false, 'Keep playing', 'ghost')}</div>
+      <div class="row">${pick(true, 'End the game')}${pick(false, 'Keep playing')}</div>
       <p class="muted choice">Your choice: ${c === true ? 'end the game' : c === false ? 'keep playing' : 'nothing yet'}. You can change it until everyone has answered.</p></div>`;
   }
   if (!murder) {
@@ -180,6 +243,24 @@ function murderView(e) {
     <div class="tiles">${tiles}</div>`;
 }
 
+// The last players show their roles one at a time; the winner is announced after the last one.
+function revealPanel() {
+  const left = S.players.filter(p => p.alive && !p.revealed);
+  const names = left.map(p => esc(p.display_name)).join(', ');
+  if (S.admin) {
+    const rows = left.map(p => `<div class="pick-row"><span class="pick">${avatar(p, 'sm')} ${esc(p.display_name)}</span>
+      <button class="ghost small" data-act="gmreveal" data-player="${esc(p.id)}">Reveal</button></div>`).join('');
+    return `<div class="slip"><h3>Roles to reveal</h3><p class="muted">The players still standing show who they are. The winner is announced after the last one. You can reveal anyone yourself.</p>
+      ${rows || '<p class="muted">Everyone has revealed.</p>'}${left.length ? '<div class="row" style="margin-top:12px"><button data-act="gmrevealall">Reveal all</button></div>' : ''}</div>`;
+  }
+  const mine = S.me?.alive && !S.me.revealed;
+  return `<div class="slip"><h3>Time to reveal</h3>
+    <p>The game is nearly over. The players still standing now show who they are, and then the winner is announced.</p>
+    ${mine ? '<div class="row"><button data-act="revealme">Reveal my role</button></div>'
+      : S.me?.alive ? '<p class="muted">You have revealed your role.</p>' : ''}
+    ${left.length ? `<p class="muted choice">Still to reveal: ${names}.</p>` : ''}</div>`;
+}
+
 function offerCard() {
   const e = S.events.find(x => x.id === S.offer);
   return `<div class="slip murder"><h3>The traitors have chosen you</h3>
@@ -189,20 +270,39 @@ function offerCard() {
     <button class="ghost" data-act="refuse" data-ev="${esc(S.offer)}">Refuse</button></div></div>`;
 }
 
-function timeline() {
-  const done = S.events.filter(e => e.status === 'revealed').reverse().slice(0, 6);
-  const items = done.map(e => {
-    const r = S.results[e.id], verb = e.kind === 'banishment' ? 'banished' : 'murdered';
-    if (e.kind === 'endgame') return `<li class="banishment">${r?.accepted ? 'Everyone chose to end the game.' : 'Not everyone chose to end the game, so it goes on.'}</li>`;
-    // Only traitors can read a recruit result; everyone else sees an ordinary quiet round.
-    if (r?.kind === 'recruit') {
-      return `<li class="${esc(e.kind)}"><b>${esc(name(r.target))}</b> ${r.accepted ? 'accepted and joined the traitors.' : 'refused. Nobody was murdered.'}</li>`;
-    }
-    const t = r?.target;
-    // The saved text is the same breakdown Slack gets: a "Votes:" line, then one line per target, then notes.
-    const votes = r?.votes ? `<div class="votes"><b>Votes</b><br>${r.votes.split('\n').slice(1).map(esc).join('<br>')}</div>` : '';
-    return `<li class="${esc(e.kind)}">${t ? `<b>${esc(name(t))}</b> was ${verb}.${S.roles[t] ? ` They were ${esc(S.roles[t])}.` : ''}` : `Nobody was ${verb}.`}${votes}</li>`;
-  }).join('');
+function resultItem(e) {
+  const r = S.results[e.id], verb = e.kind === 'banishment' ? 'banished' : 'murdered';
+  if (e.kind === 'endgame') return `<li class="banishment">${r?.accepted ? 'Everyone chose to end the game.' : 'Not everyone chose to end the game, so it goes on.'}</li>`;
+  // Only traitors can read a recruit result; everyone else sees an ordinary quiet round.
+  if (r?.kind === 'recruit') {
+    return `<li class="${esc(e.kind)}"><b>${esc(name(r.target))}</b> ${r.accepted ? 'accepted and joined the traitors.' : 'refused. Nobody was murdered.'}</li>`;
+  }
+  const t = r?.target;
+  // The saved text is the same breakdown Slack gets: a "Votes:" line, then one line per target, then notes.
+  const votes = r?.votes ? `<div class="votes"><b>Votes</b><br>${r.votes.split('\n').slice(1).map(esc).join('<br>')}</div>` : '';
+  return `<li class="${esc(e.kind)}">${t ? `<b>${esc(name(t))}</b> was ${verb}.${S.roles[t] ? ` They were ${esc(S.roles[t])}.` : ''}` : `Nobody was ${verb}.`}${votes}</li>`;
+}
+
+// Results the viewer hasn't dismissed yet, so a vote that closes while they are looking at the game can't go unnoticed.
+const seenKey = () => `tt-seen-${S.game.id}`;
+function newsBanner() {
+  const done = S.events.filter(e => e.status === 'revealed');
+  let seen = null;
+  try { seen = localStorage.getItem(seenKey()); } catch {}
+  const i = done.findIndex(e => e.id === seen);
+  const fresh = (i < 0 ? done : done.slice(i + 1)).slice(-3).reverse();
+  if (!fresh.length) return '';
+  return `<div class="news"><h3>What just happened</h3><ol class="timeline">${fresh.map(resultItem).join('')}</ol>
+    <div class="row"><button data-act="seennews">Got it</button></div></div>`;
+}
+
+function timeline(limit = 6) {
+  // Every final reveal is kept, however many results there are; only the older event results are capped.
+  const events = S.events.filter(e => e.status === 'revealed').slice(-limit).map(e => ({ t: new Date(e.reveals_at), html: resultItem(e) }));
+  const reveals = S.players.filter(p => p.revealed && S.roles[p.id]).map(p => ({
+    t: new Date(p.revealed_at ?? Date.now()),
+    html: `<li class="banishment"><b>${esc(p.display_name)}</b> revealed they were ${S.roles[p.id] === 'traitor' ? 'a traitor' : 'faithful'}.</li>` }));
+  const items = [...events, ...reveals].sort((a, b) => b.t - a.t).map(x => x.html).join('');
   return items ? `<ol class="timeline">${items}</ol>` : '<p class="muted">Nothing has happened yet.</p>';
 }
 
@@ -216,7 +316,7 @@ function roleCard(role) {
   const line = !me.alive ? 'You are out of the game.'
     : traitor ? (mates.length ? `With ${mates.join(', ')}. Pick a victim when a murder opens.` : 'You are the last traitor.')
     : 'Find the traitors and banish them.';
-  return `<div class="role open ${esc(role)}"><span class="seal ${traitor ? '' : 'faithful'}">${traitor ? 'T' : 'F'}</span>
+  return `<div class="role open ${S.peekNew ? 'anim ' : ''}${esc(role)}"><span class="seal ${traitor ? '' : 'faithful'}">${traitor ? 'T' : 'F'}</span>
     <span><span class="roleName">${traitor ? 'Traitor' : 'Faithful'}</span><br><span class="muted">${line}</span></span></div>`;
 }
 
@@ -307,15 +407,15 @@ function dashboard() {
       <div class="meter"><i style="width:${pct}%"></i></div>${who}${controls(e)}</div>`;
   }).join('');
   const turnout = d.history.length ? `<p class="muted">Recent votes, newest first: ${d.history.map(h => `${h.voted} voted`).join(', ')}</p>` : '';
-  return `<div class="card"><h3>Right now</h3>
-    <div class="stats"><div><b>${d.alive}</b><span>alive</span></div><div><b>${d.out}</b><span>out</span></div></div>
-    ${items || '<p class="muted">Nothing is scheduled.</p>'}${turnout}
-    ${d.phase === 'normal' ? `<div class="dash-item"><b>Start the end game early</b><p class="muted">Voids anything open, cancels everything scheduled and starts the final banishment. The end game vote follows it.</p>
+  const endCard = d.phase === 'normal' && !S.game.revealing ? `<div class="dash-item"><b>Start the end game early</b><p class="muted">Voids anything open, cancels everything scheduled and starts the final banishment. The end game vote follows it.</p>
       <div class="row"><button class="ghost" data-act="startend">Start the end game now</button></div></div>`
-      : `<div class="dash-item"><b>${d.phase === 'final' ? 'Final banishment' : 'End game'}</b><p class="muted">No murders and no deadlines now. Each vote closes when everyone alive has answered.</p></div>`}
-    <div class="dash-item"><b>Delay the whole game</b><p class="muted">Moves every event still to come, for a holiday or an outage.</p>
+      : `<div class="dash-item"><b>${d.phase === 'final' ? 'Final banishment' : 'End game'}</b><p class="muted">No murders and no deadlines now. Each vote closes when everyone alive has answered.</p></div>`;
+  return `<div class="card wide"><h3>Right now</h3><div class="dash-cols">
+    <div><div class="stats"><div><b>${d.alive}</b><span>alive</span></div><div><b>${d.out}</b><span>out</span></div></div>${endCard}</div>
+    <div>${items || '<p class="muted">Nothing is scheduled.</p>'}${turnout}</div>
+    <div><div class="dash-item"><b>Delay the whole game</b><p class="muted">Moves every event still to come, for a holiday or an outage.</p>
       <div class="row"><button class="ghost" data-act="shift" data-by="1 day">Delay a day</button>
-      <button class="ghost" data-act="shift" data-by="2 days">Delay 2 days</button></div></div></div>`;
+      <button class="ghost" data-act="shift" data-by="2 days">Delay 2 days</button></div></div></div></div></div>`;
 }
 
 // Everything, including roles and picks. Hidden until asked for so the GM never spoils themself by accident.
@@ -325,8 +425,11 @@ function curtain() {
   const sec = S.secrets;
   if (!sec) return `<div class="card"><h3>Behind the curtain</h3><p class="muted">Loading…</p></div>`;
   const roleTag = p => p.role ? `<span class="tag ${esc(p.role)}">${esc(p.role)}</span>` : '';
-  const players = sec.players.map(p => `<p class="${p.alive ? '' : 'muted'}">${p.alive ? '' : '<s>'}${esc(p.name)}${p.alive ? '' : '</s>'} ${roleTag(p)}</p>`).join('');
-  const picks = sec.picks.map(k => `<p>${k.event_kind === 'banishment' ? 'Vote' : 'Traitor pick'}: <b>${esc(k.who)}</b> → ${esc(k.target ? `${k.kind === 'recruit' ? 'recruit ' : ''}${k.target}` : 'nobody')}</p>`).join('');
+  const murdered = murderedIds();
+  const players = sec.players.map(p => `<p class="${p.alive ? '' : 'muted'}">${p.alive ? '' : '<s>'}${esc(p.name)}${p.alive ? '' : '</s>'} ${murdered.has(p.id) ? '<img class="mini-cross" src="assets/murdered.svg" alt="Murdered" title="Murdered">' : ''}${roleTag(p)}</p>`).join('');
+  const picks = sec.picks.map(k => k.event_kind === 'endgame'
+    ? `<p>End game: <b>${esc(k.who)}</b> → ${k.end_vote === true ? 'end the game' : k.end_vote === false ? 'keep playing' : 'answered'}</p>`
+    : `<p>${k.event_kind === 'banishment' ? 'Vote' : 'Traitor pick'}: <b>${esc(k.who)}</b> → ${esc(k.target ? `${k.kind === 'recruit' ? 'recruit ' : ''}${k.target}` : 'nobody')}</p>`).join('');
   const offers = sec.offers.map(o => `<p>Recruit offer to <b>${esc(o.target)}</b>: ${o.accepted === null ? 'waiting for an answer' : o.accepted ? 'accepted' : 'refused'}</p>`).join('');
   const chat = S.gmchat.map(m => `<p><b>${esc(m.who)}</b>: ${esc(m.body)}</p>`).join('') || '<p class="muted">No messages yet.</p>';
   return `<div class="card"><h3>Behind the curtain</h3>
@@ -354,7 +457,7 @@ function gmPanel() {
     <div class="row"><input id="slackurl" placeholder="https://hooks.slack.com/..." autocomplete="off">
       <button data-act="slacksave">Save</button>
       ${o.slack_on ? '<button class="ghost" data-act="slacktest">Send test</button><button class="ghost" data-act="slackoff">Disconnect</button>' : ''}</div>
-    <div class="gm-actions"><button class="ghost" data-act="delete">Delete game</button></div></div>`;
+    <div class="gm-actions split"><button class="ghost" data-act="delete">Delete game</button>${S.game.status === 'finished' ? '<button class="ghost" data-act="archive">Archive this game</button>' : ''}</div></div>`;
 }
 
 function view() {
@@ -380,36 +483,37 @@ function view() {
   if (S.admin && S.gmPick) return gmPickerView();
   if (!S.admin && S.person && ((!S.person.avatar_key && !S.skipPhoto) || S.picking)) return pickerView();
   const g = S.game;
-  if (!g) return S.admin ? `<p>No game yet.</p><button data-act="create">Create game</button>` : `<p>No game yet. Check back soon.</p>`;
+  if (!g) return S.admin ? `<p>No game yet.</p><button data-act="create">Create game</button>${archivedList()}` : `<p>No game yet. Check back soon.</p>`;
   if (g.status === 'lobby') {
     if (S.admin) return S.lobbyStep === 'traitors' ? traitorsStep() : playersStep();
     return S.me ? `<h2>Lobby</h2><p class="muted">Waiting for the game master to start.</p>${playerGrid()}`
                 : `<p>You haven't been added to this game yet. Ask the game master.</p>`;
   }
   if (g.status === 'finished') {
-    return `<div class="winner ${esc(g.winner)}"><h1>${g.winner === 'faithful' ? 'The Faithful win' : 'The Traitors win'}</h1></div>${playerGrid()}<h2>What happened</h2>${timeline()}${S.admin ? gmPanel() : ''}${S.admin ? '<button data-act="create">New game</button>' : ''}`;
+    return `${winnerHero()}${playerGrid()}<h2>What happened</h2>${timeline()}${S.admin ? gmPanel() : ''}${S.admin ? '<div class="gm-actions"><button data-act="create">New game</button></div>' + archivedList() : ''}`;
   }
-  if (S.admin) return `<h2>Game in progress</h2><div class="gm-grid">${dashboard()}${curtain()}${gmPanel()}</div>`;
+  if (S.admin) return `${newsBanner()}${g.revealing ? revealPanel() : ''}<h2>Game in progress</h2><div class="gm-grid">${dashboard()}${curtain()}${gmPanel()}</div>`;
   if (!S.me) return `<p>A game is in progress and you're not in it.</p>`;
   const role = S.roles[S.me.id], isTraitor = role === 'traitor';
   const tabs = isTraitor ? `<div class="seg" style="margin:0 0 20px"><button class="ghost ${S.tab === 'game' ? 'active' : ''}" data-act="tab" data-tab="game">Game</button>
     <button class="ghost ${S.tab === 'chat' ? 'active' : ''}" data-act="tab" data-tab="chat">Traitors chat</button></div>` : '';
   if (isTraitor && S.tab === 'chat') return `${tabs}<h2 style="margin-top:0">Traitors chat</h2>${chat()}`;
-  const finalNote = S.game.phase !== 'normal' ? '<p class="muted">The final stages. There are no more murders and roles are no longer revealed. Each vote closes when everyone alive has answered.</p>' : '';
+  const finalNote = S.game.revealing ? '' : S.game.phase !== 'normal' ? '<p class="muted">The final stages. There are no more murders and roles are no longer revealed. Each vote closes when everyone alive has answered.</p>' : '';
   return `${tabs}${finalNote}${S.offer ? offerCard() : ''}${roleCard(role)}
-    ${S.events.filter(isOpen).map(eventPanel).join('')}<h2>Players</h2>${playerGrid()}<h2>What happened</h2>${timeline()}`;
+    ${newsBanner()}${S.game.revealing ? revealPanel() : ''}${S.events.filter(isOpen).map(eventPanel).join('')}<h2>Players</h2>${playerGrid()}<h2>What happened</h2>${timeline()}`;
 }
 
 function render() {
   const keep = {};
   app.querySelectorAll('select,input').forEach(e => { keep[e.id] = e.value; });
   const focus = document.activeElement?.id;
-  const header = S.user ? `<div class="bar"><span class="who"><span class="muted">${esc(S.user.email)}</span>${S.person && !S.admin && (S.person.avatar_key || S.skipPhoto) && !S.picking ? `<a href="#" data-act="changephoto">Edit</a>` : ''}<button class="ghost" data-act="logout">Sign out</button></span></div>` : '';
+  const header = S.user ? `<div class="bar"><span class="who"><span class="muted">${S.person ? `<b class="uname">${esc(S.person.name)}</b> ` : ''}${esc(S.user.email)}</span>${S.person && !S.admin && (S.person.avatar_key || S.skipPhoto) && !S.picking ? `<a href="#" data-act="changephoto">Edit</a>` : ''}<button class="ghost" data-act="logout">Sign out</button></span></div>` : '';
   app.innerHTML = header + (S.error ? `<div class="error">${esc(S.error)}</div>` : '')
     + (S.notice ? `<div class="notice">${esc(S.notice)}</div>` : '') + view()
     + (S.user ? `<footer class="site-foot"><img src="assets/dev-x-traitors.svg" alt="DEV x Traitors" width="233" height="60"></footer>` : '');
   for (const [id, v] of Object.entries(keep)) { const e = document.getElementById(id); if (e && id) e.value = v; }
   if (focus) document.getElementById(focus)?.focus();
+  if (S.game?.status === 'finished' && S.user) confetti();
   const log = document.getElementById('log');
   if (log) log.scrollTop = log.scrollHeight;
   tick();
@@ -431,7 +535,9 @@ const actions = {
   },
   peek: () => {
     S.peek = true;
+    S.peekNew = true; // only the render caused by the tap animates; the 10 s refresh re-renders without replaying it
     render();
+    S.peekNew = false;
     clearTimeout(S.peekTimer);
     S.peekTimer = setTimeout(() => { S.peek = false; render(); }, 6000);
   },
@@ -499,7 +605,7 @@ const actions = {
   savemine: async () => {
     const n = document.getElementById('ename').value.trim(), pw = document.getElementById('epw').value;
     if (pw && pw.length < 8) { S.error = 'Password must be at least 8 characters'; return render(); }
-    if (n !== S.person.display_name) {
+    if (n !== S.person.name) {
       const { error } = await sb.rpc('set_name', { p_user: S.user.id, p_name: n });
       if (error) { S.error = error.message; return render(); }
     }
@@ -557,6 +663,11 @@ const actions = {
     S.voteKind = m?.kind === 'recruit' ? 'recruit' : 'kill';
     render();
   },
+  seennews: () => {
+    const last = S.events.filter(e => e.status === 'revealed').pop();
+    try { if (last) localStorage.setItem(seenKey(), last.id); } catch {}
+    render();
+  },
   votekind: el => { S.voteKind = el.dataset.kind; render(); },
   nomurder: () => { S.voteSel = 'none'; render(); },
   voteback: () => { S.voting = null; render(); },
@@ -576,9 +687,20 @@ const actions = {
     if (!S.error) { S.notice = 'You refused. Nothing happens.'; render(); }
   },
   endgame: el => call('cast_endgame', { p_event: el.dataset.ev, p_end: el.dataset.end === 'true' }),
+  revealme: () => call('reveal_my_role', { p_game: S.game.id }),
+  gmreveal: el => call('gm_reveal_role', { p_player: el.dataset.player }),
+  gmrevealall: () => confirm('Reveal every remaining role now?') && call('gm_reveal_all', { p_game: S.game.id }),
   startend: () => confirm('Start the end game now? Anything open is voided and the final banishment begins.') && call('gm_start_endgame', { p_game: S.game.id }),
   close: el => call('gm_force_close', { p_event: el.dataset.ev }),
   extend: el => call('gm_extend_event', { p_event: el.dataset.ev, p_by: el.dataset.by || '1 day' }),
+  archiveopen: async el => {
+    const id = el.dataset.id;
+    if (S.openArchive === id) { S.openArchive = null; return render(); }
+    if (!S.archiveData[id]) S.archiveData[id] = await fetchGame(id);
+    S.openArchive = id;
+    render();
+  },
+  archive: () => confirm('Archive this game? It moves to the archived list and a new game can start.') && call('gm_archive_game', { p_game: S.game.id }),
   delete: () => confirm('Delete this game and all its data?') && call('gm_delete_game', { p_game: S.game.id }),
   tab: el => { S.tab = el.dataset.tab; render(); },
   send: () => {

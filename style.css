@@ -83,7 +83,7 @@ button.active { border-color: var(--orange); color: var(--orange); }
 }
 .seal.faithful { background: radial-gradient(circle at 35% 30%, #f6e7b0, #9a7a1f 75%); color: #2a1d04; }
 @media (prefers-reduced-motion: no-preference) {
-  .role.open { animation: unseal .35s ease-out; }
+  .role.open.anim { animation: unseal .35s ease-out; }
   @keyframes unseal { from { opacity: 0; transform: scale(.97); } }
 }
 
@@ -169,12 +169,16 @@ button.small { padding: 6px 10px; font-size: .85rem; white-space: nowrap; }
 .tile a, .pick-row a { font-size: .85rem; color: var(--orange); }
 .gm-panel { margin-top: 32px; }
 
-/* Wide screens: the GM's three cards sit side by side. */
+/* Wide screens: "Right now" runs across the top in columns, the other two cards share the row below. */
 @media (min-width: 1000px) {
   main:has(.gm-grid) { max-width: 1400px; }
-  .gm-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; align-items: start; }
+  .gm-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; align-items: start; }
   .gm-grid > .card { margin: 0; }
+  .gm-grid > .card.wide { grid-column: 1 / -1; }
+  .dash-cols { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 28px; }
+  .dash-cols .dash-item:first-child { border-top: 0; padding-top: 0; }
 }
+.mini-cross { width: 14px; height: 16px; vertical-align: -2px; margin-right: 4px; }
 
 .form a, .bar a { font-size: .85rem; color: var(--orange); white-space: nowrap; }
 
@@ -190,3 +194,30 @@ button.small { padding: 6px 10px; font-size: .85rem; white-space: nowrap; }
 .voted { display: grid; gap: 6px; margin: 4px 0 12px; }
 .voteface { display: flex; align-items: center; gap: 14px; }
 .bigname { font: 1.9rem/1.1 var(--display); letter-spacing: .04em; color: var(--orange); font-weight: 400; }
+
+/* In-game notice of results the player hasn't dismissed */
+.news { background: var(--panel); border: 1px solid var(--orange); border-radius: 12px; padding: 16px; margin: 0 0 16px; }
+.news .timeline { margin: 8px 0 14px; }
+
+/* Winner celebration */
+.winner { text-align: center; padding: 8px 0 24px; }
+.winner h1 { font-size: 3rem; margin: 4px 0 20px; }
+.winners { display: flex; flex-wrap: wrap; justify-content: center; gap: 22px; margin: 0 0 18px; }
+.winface { display: grid; justify-items: center; gap: 8px; }
+.winface .av { width: 104px; height: 104px; box-shadow: 0 0 0 4px var(--orange), 0 0 28px rgba(255,130,0,.45); }
+.winface .av b { font-size: 2.4rem; }
+.winner.traitors .winface .av { box-shadow: 0 0 0 4px var(--seal), 0 0 28px rgba(255,102,133,.45); }
+.winner.faithful .winface .av { box-shadow: 0 0 0 4px var(--faithful), 0 0 28px rgba(241,223,174,.4); }
+.confetti { position: fixed; top: -12px; width: 9px; height: 14px; border-radius: 2px; pointer-events: none; z-index: 50; animation: fall linear forwards; }
+@keyframes fall { to { transform: translateY(105vh) rotate(720deg); } }
+
+.uname { color: var(--bone); font-weight: 500; }
+
+.archive { list-style: none; margin: 8px 0 0; padding: 0; }
+.archive li { border-top: 1px solid var(--line); }
+button.archrow { display: flex; justify-content: space-between; align-items: center; gap: 12px; width: 100%; padding: 12px 0; background: none; color: var(--bone); border: 0; border-radius: 0; font-weight: 400; text-align: left; }
+button.archrow:hover:not(:disabled) { background: none; color: var(--orange); }
+.archrow .caret { color: var(--orange); font-size: .9rem; }
+.archbody { padding: 4px 0 24px; }
+
+.gm-actions.split { justify-content: space-between; }

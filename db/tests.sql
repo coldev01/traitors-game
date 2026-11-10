@@ -362,18 +362,26 @@ select pg_temp.mk('b5', 'banishment', '2026-11-10 09:00+00', '2026-11-11 15:00+0
 update players set alive = false where display_name = 'a' and game_id = tests.g();
 select pg_temp.act('b5', 'c', 'b'); select pg_temp.act('b5', 'd', 'b');
 select advance_games('2026-11-11 15:01+00');
-select tests.eq((select winner from games where id = tests.g()), 'faithful', 'all traitors out -> faithful win');
+select tests.eq((select status from games where id = tests.g()), 'active', 'all traitors out does not end the game by itself');
+-- ...but it ends at 2 left, and with no traitor among them the faithful win.
+update players set alive = false where id in (select id from players where game_id = tests.g() and alive order by display_name offset 2);
+select check_win(tests.g());
+select tests.eq((select revealing from games where id = tests.g()), true, '2 left starts the reveal stage');
+select tests.eq((select winner from games where id = tests.g()), null, 'nobody has won until the roles are shown');
+select do_reveal(id) from players where game_id = tests.g() and alive;
+select tests.eq((select winner from games where id = tests.g()), 'faithful', '2 left and no traitor -> faithful win');
 
 -- traitors equal faithful -> traitors win
-update games set status = 'active', winner = null where id = tests.g();
-update players set alive = true where game_id = tests.g();
-update players set alive = false where display_name in ('c', 'd', 'e', 'f') and game_id = tests.g();
+update games set status = 'active', winner = null, revealing = false where id = tests.g();
+update players set alive = true, revealed = false where game_id = tests.g();
+update players set alive = false where display_name in ('c', 'd', 'e', 'f', 'h') and game_id = tests.g();
 select pg_temp.mk('b6', 'banishment', '2026-11-12 09:00+00', '2026-11-13 15:00+00', '2026-11-13 15:00+00');
 select pg_temp.act('b6', 'a', 'g');
 -- Few alive would make this the final banishment; this test is about the normal path.
 update games set phase = 'final' where id = tests.g();
 select advance_games('2026-11-13 15:01+00');
-select tests.eq((select winner from games where id = tests.g()), 'traitors', 'traitors >= faithful -> traitors win');
+select do_reveal(id) from players where game_id = tests.g() and alive;
+select tests.eq((select winner from games where id = tests.g()), 'traitors', '2 left with a traitor among them -> traitors win');
 rollback to savepoint s4;
 
 -------------------------------------------------------------------- 4b. votes for a player who was murdered meanwhile
@@ -978,7 +986,12 @@ select tests.vote_all((select id from events where game_id = tests.g() and kind 
 select tests.eq((select alive from players where id = tests.pid(tests.g(), 'g')), false, 'g banished');
 select tests.eq((select count(*) from events where game_id = tests.g() and kind = 'endgame' and status = 'open'), 1::bigint, 'a fresh end game vote opens');
 select tests.endgame_all((select id from events where game_id = tests.g() and kind = 'endgame' and status = 'open'), array['b', 'd', 'e', 'f'], true);
-select tests.eq((select status from games where id = tests.g()), 'finished', 'unanimous end game ends the game');
+select tests.eq((select revealing and status = 'active' from games where id = tests.g()), true, 'unanimous end game starts the reveal stage');
+select tests.eq((select count(*) from events where game_id = tests.g() and status in ('open', 'scheduled')), 0::bigint, 'nothing is open in the reveal stage');
+select do_reveal(tests.pid(tests.g(), 'b'));
+select tests.eq((select status from games where id = tests.g()), 'active', 'still waiting for the others to reveal');
+select do_reveal(id) from players where game_id = tests.g() and alive;
+select tests.eq((select status from games where id = tests.g()), 'finished', 'all revealed ends the game');
 select tests.eq((select winner from games where id = tests.g()), 'traitors', 'a traitor still alive: the traitors win');
 rollback to savepoint s14a;
 
@@ -994,7 +1007,11 @@ select tests.vote_all('00000000-0000-0000-0000-0000000000d5', array['a', 'c', 'd
 select tests.vote_all('00000000-0000-0000-0000-0000000000d5', array['b'], 'a');
 select tests.eq((select phase from games where id = tests.g()), 'endgame', 'faithful b banished, a traitor remains: end game');
 select tests.endgame_all((select id from events where game_id = tests.g() and kind = 'endgame'), array['a', 'c', 'd', 'e', 'f'], true);
-select tests.eq((select winner from games where id = tests.g()), 'traitors', 'ending it with the traitor alive loses');
+insert into admins values ('gm@org.test') on conflict do nothing;
+select tests.act_as('gm');
+select gm_reveal_all(tests.g());
+select tests.reset();
+select tests.eq((select winner from games where id = tests.g()), 'traitors', 'GM reveal all: ending it with the traitor alive loses');
 rollback to savepoint s14b;
 
 -- the GM can force an end game vote through when someone is missing, and "no answer" counts as keep playing
@@ -1038,6 +1055,22 @@ select tests.act_as('gm');
 select tests.throws(format($$select gm_start_endgame(%L)$$, tests.g()), 'already', 'cannot start it twice');
 select tests.reset();
 rollback to savepoint s14d;
+
+-------------------------------------------------------------------- 15. archiving a finished game
+savepoint s15;
+insert into admins values ('gm@org.test') on conflict do nothing;
+select set_config('t.g', tests.make_game(6)::text, false);
+select tests.act_as('gm');
+select tests.throws(format($$select gm_archive_game(%L)$$, tests.g()), 'finished', 'only a finished game can be archived');
+select tests.reset();
+update games set status = 'finished', winner = 'faithful' where id = tests.g();
+select tests.act_as('a');
+select tests.throws(format($$select gm_archive_game(%L)$$, tests.g()), 'admin only', 'a player cannot archive');
+select tests.act_as('gm');
+select gm_archive_game(tests.g());
+select tests.reset();
+select tests.eq((select archived from games where id = tests.g()), true, 'the GM archives a finished game');
+rollback to savepoint s15;
 
 rollback;
 select 'all tests passed' as result;

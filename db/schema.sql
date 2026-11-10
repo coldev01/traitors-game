@@ -112,6 +112,10 @@ alter table messages add column if not exists from_gm boolean not null default f
 -- stays secret until the game ends.
 alter table games add column if not exists phase text not null default 'normal' check (phase in ('normal', 'final', 'endgame'));
 alter table events add column if not exists untimed boolean not null default false;
+alter table games add column if not exists revealing boolean not null default false;
+alter table games add column if not exists archived boolean not null default false;
+alter table players add column if not exists revealed boolean not null default false;
+alter table players add column if not exists revealed_at timestamptz;
 alter table players add column if not exists role_public boolean not null default true;
 alter table actions add column if not exists end_vote boolean;
 alter table events drop constraint if exists events_kind_check;
@@ -148,23 +152,26 @@ $$;
 drop policy if exists games_select on games;
 create policy games_select on games for select to authenticated using (true);
 drop policy if exists players_select on players;
-create policy players_select on players for select to authenticated using (in_game(game_id));
+-- The GM is not a player, but runs the game and has to see who is in it and what has happened (never roles, below).
+create policy players_select on players for select to authenticated using (in_game(game_id) or is_admin());
 drop policy if exists events_select on events;
-create policy events_select on events for select to authenticated using (in_game(game_id));
+create policy events_select on events for select to authenticated using (in_game(game_id) or is_admin());
 
 drop policy if exists roles_select on roles;
 create policy roles_select on roles for select to authenticated using (
+  (is_admin() and exists (select 1 from games g where g.id = roles.game_id and g.status = 'finished')) or
   in_game(game_id) and (
     player_id = my_player(game_id)
     or (is_traitor(game_id) and role = 'traitor')
     or exists (select 1 from players p where p.id = roles.player_id and not p.alive and p.role_public)
+    or exists (select 1 from players p where p.id = roles.player_id and p.revealed)
     or exists (select 1 from games g where g.id = roles.game_id and g.status = 'finished')
   )
 );
 
 drop policy if exists results_select on event_results;
 create policy results_select on event_results for select to authenticated using (
-  in_game(game_id)
+  (in_game(game_id) or is_admin())
   and exists (select 1 from events e where e.id = event_id and e.status = 'revealed')
   and (kind = 'kill' or is_traitor(game_id))
 );
@@ -385,17 +392,64 @@ begin
   if not found then raise exception 'no offer'; end if;
 end $$;
 
+-- The game ends only at 2 players left (the end game vote handles the rest). Parity or an empty traitor side does
+-- not end it: players can't tell whether the last traitor has gone, so the game can't announce it by stopping.
+-- Either way of finishing goes through the reveal stage first, where the last players show their roles.
 create or replace function check_win(p_game uuid) returns void language plpgsql security definer set search_path = public as $$
-declare t int; f int;
+declare n int;
 begin
-  select count(*) filter (where r.role = 'traitor'), count(*) filter (where r.role = 'faithful')
-  into t, f from players p join roles r on r.player_id = p.id
-  where p.game_id = p_game and p.alive;
-  if t = 0 then
-    update games set status = 'finished', winner = 'faithful' where id = p_game;
-  elsif t >= f then
-    update games set status = 'finished', winner = 'traitors' where id = p_game;
-  end if;
+  select count(*) into n from players where game_id = p_game and alive;
+  if n <= 2 and not (select revealing from games where id = p_game) then perform begin_reveal(p_game); end if;
+end $$;
+
+-- Nothing is scheduled or open any more; the players still alive show their roles one at a time.
+create or replace function begin_reveal(p_game uuid) returns void language plpgsql security definer set search_path = public as $$
+begin
+  update games set revealing = true where id = p_game;
+  delete from events where game_id = p_game and status in ('scheduled', 'open');
+  perform slack_post('The game is nearly over. The players still standing now reveal who they are.');
+  perform finish_if_revealed(p_game);
+end $$;
+
+create or replace function finish_if_revealed(p_game uuid) returns void language plpgsql security definer set search_path = public as $$
+declare w text;
+begin
+  if not (select revealing from games where id = p_game) then return; end if;
+  if exists (select 1 from players where game_id = p_game and alive and not revealed) then return; end if;
+  select case when exists (select 1 from players p join roles r on r.player_id = p.id
+                           where p.game_id = p_game and p.alive and r.role = 'traitor') then 'traitors' else 'faithful' end into w;
+  update games set status = 'finished', winner = w where id = p_game;
+  perform slack_post(case w when 'faithful' then 'The game is over. The Faithful win!' else 'The game is over. The Traitors win!' end);
+end $$;
+
+create or replace function do_reveal(p_player uuid) returns void language plpgsql security definer set search_path = public as $$
+declare pl players; v_role text;
+begin
+  select * into pl from players where id = p_player for update;
+  if pl.id is null or not pl.alive or pl.revealed or not (select revealing from games where id = pl.game_id) then return; end if;
+  update players set revealed = true, revealed_at = clock_timestamp() where id = p_player;
+  select role into v_role from roles where player_id = p_player;
+  perform slack_post(format('%s reveals their role: %s.', pl.display_name, case v_role when 'traitor' then 'a traitor' else 'faithful' end));
+  perform finish_if_revealed(pl.game_id);
+end $$;
+
+create or replace function reveal_my_role(p_game uuid) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if my_player(p_game) is null then raise exception 'not in this game'; end if;
+  perform do_reveal(my_player(p_game));
+end $$;
+
+create or replace function gm_reveal_role(p_player uuid) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  perform do_reveal(p_player);
+end $$;
+
+create or replace function gm_reveal_all(p_game uuid) returns void language plpgsql security definer set search_path = public as $$
+declare r uuid;
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  for r in select id from players where game_id = p_game and alive and not revealed loop perform do_reveal(r); end loop;
 end $$;
 
 -- Dead voters and dead targets are filtered here, not at cast time, because a murder is only
@@ -494,13 +548,8 @@ begin
     select accepted into v_accepted from event_results where event_id = p_event;
     update events set status = 'revealed' where id = p_event;
     if v_accepted then
-      update games set status = 'finished', phase = 'endgame',
-        winner = case when exists (select 1 from players p join roles r on r.player_id = p.id
-                                   where p.game_id = ev.game_id and p.alive and r.role = 'traitor') then 'traitors' else 'faithful' end
-      where id = ev.game_id;
-      select * into g from games where id = ev.game_id;
       perform slack_post('Everyone chose to end the game.');
-      perform slack_post(case g.winner when 'faithful' then 'The game is over. The Faithful win!' else 'The game is over. The Traitors win!' end);
+      perform begin_reveal(ev.game_id);
     else
       perform slack_post('Not everyone chose to end the game, so it goes on.');
       perform open_final_banishment(ev.game_id);
@@ -537,8 +586,8 @@ begin
 
   perform check_win(ev.game_id);
   select * into g from games where id = ev.game_id;
-  if g.status = 'finished' then
-    perform slack_post(case g.winner when 'faithful' then 'The game is over. The Faithful win!' else 'The game is over. The Traitors win!' end);
+  if g.revealing or g.status = 'finished' then
+    null; -- the reveal stage posts its own announcements
   elsif ev.untimed then
     -- The last banishment is done and the game is still on: the end game vote follows, with no murder in between.
     declare t timestamptz := clock_timestamp();
@@ -638,6 +687,16 @@ begin
 end $$;
 
 -- Retention: spec says player data is deleted after a game ends.
+-- A finished game can be put away so the app moves on to a fresh one; it stays in the database and in the GM's archive list.
+create or replace function gm_archive_game(p_game uuid) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  if (select status from games where id = p_game) is distinct from 'finished' then raise exception 'Only a finished game can be archived'; end if;
+  update games set archived = true where id = p_game;
+end $$;
+revoke execute on function gm_archive_game(uuid) from public, anon;
+grant execute on function gm_archive_game(uuid) to authenticated;
+
 create or replace function gm_delete_game(p_game uuid) returns void language plpgsql security definer set search_path = public as $$
 begin
   if not is_admin() then raise exception 'admin only'; end if;
@@ -656,7 +715,7 @@ create or replace function gm_start_endgame(p_game uuid) returns void language p
 begin
   if not is_admin() then raise exception 'admin only'; end if;
   if (select status from games where id = p_game) is distinct from 'active' then raise exception 'The game is not running'; end if;
-  if (select phase from games where id = p_game) <> 'normal' then raise exception 'The end game has already started'; end if;
+  if (select phase from games where id = p_game) <> 'normal' or (select revealing from games where id = p_game) then raise exception 'The end game has already started'; end if;
   delete from events where game_id = p_game and status = 'scheduled';
   update actions set target_id = null where event_id in (select id from events where game_id = p_game and status = 'open');
   update events set closes_at = least(closes_at, now()), reveals_at = least(reveals_at, now())
@@ -667,12 +726,12 @@ end $$;
 
 revoke execute on function
   advance_games(timestamptz), close_event(uuid), reveal_event(uuid), check_win(uuid),
-  settle_untimed(uuid), open_final_banishment(uuid),
+  settle_untimed(uuid), open_final_banishment(uuid), begin_reveal(uuid), finish_if_revealed(uuid), do_reveal(uuid),
   internal_start_game(uuid, timestamp, jsonb, int, int)
   from public, anon, authenticated;
 
-revoke execute on function gm_start_endgame(uuid), cast_endgame(uuid, boolean), my_endgame(uuid) from public, anon;
-grant execute on function gm_start_endgame(uuid), cast_endgame(uuid, boolean), my_endgame(uuid) to authenticated;
+revoke execute on function gm_start_endgame(uuid), cast_endgame(uuid, boolean), my_endgame(uuid), reveal_my_role(uuid), gm_reveal_role(uuid), gm_reveal_all(uuid) from public, anon;
+grant execute on function gm_start_endgame(uuid), cast_endgame(uuid, boolean), my_endgame(uuid), reveal_my_role(uuid), gm_reveal_role(uuid), gm_reveal_all(uuid) to authenticated;
 
 revoke execute on function
   am_admin(), default_schedule(), create_game(),
@@ -913,7 +972,7 @@ begin
                                           order by p.display_name)
                          from players p left join roles r on r.player_id = p.id where p.game_id = p_game), '[]'),
     'picks', coalesce((select jsonb_agg(jsonb_build_object('event_id', a.event_id, 'event_kind', e.kind, 'who', voter.display_name,
-                                                            'kind', a.kind, 'target', t.display_name)
+                                                            'kind', a.kind, 'target', t.display_name, 'end_vote', a.end_vote)
                                         order by e.opens_at, voter.display_name)
                        from actions a join events e on e.id = a.event_id
                        join players voter on voter.id = a.player_id
