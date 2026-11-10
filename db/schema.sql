@@ -78,6 +78,15 @@ alter table people enable row level security;
 
 -- Team photos people can choose from (files live in avatars/<key>.webp). Add a row and a file to add a photo.
 -- Each photo can belong to only one person.
+-- Who the GM has chosen to be traitors, before the game starts. Kept apart from players (which every member can
+-- read) and with no policies at all, so nobody but the GM's functions can see it.
+create table if not exists designated_traitors (
+  game_id uuid not null references games on delete cascade,
+  user_id uuid not null references auth.users on delete cascade,
+  primary key (game_id, user_id)
+);
+alter table designated_traitors enable row level security;
+
 create table if not exists photos (key text primary key);
 alter table photos enable row level security;
 insert into photos (key) select 'team-' || lpad(n::text, 2, '0') from generate_series(1, 21) n on conflict do nothing;
@@ -183,10 +192,22 @@ begin
   select count(*) into n from players where game_id = p_game;
   if n < 6 then raise exception 'need at least 6 players'; end if;
 
-  k := greatest(2, round(n / 4.0));
-  insert into roles (player_id, game_id, role)
-  select id, p_game, case when rn <= k then 'traitor' else 'faithful' end
-  from (select id, row_number() over (order by random()) rn from players where game_id = p_game) s;
+  -- The GM's chosen traitors win if there are any (only people actually in this game count); otherwise
+  -- 2 or 3 are picked at random. Either way there must be fewer traitors than faithful, or the game is over at once.
+  select count(*) into k from designated_traitors d join players p on p.user_id = d.user_id and p.game_id = d.game_id
+  where d.game_id = p_game;
+  if k > 0 then
+    if k >= n - k then raise exception 'There must be fewer traitors than faithful'; end if;
+    insert into roles (player_id, game_id, role)
+    select p.id, p_game, case when exists (select 1 from designated_traitors d where d.game_id = p_game and d.user_id = p.user_id)
+                              then 'traitor' else 'faithful' end
+    from players p where p.game_id = p_game;
+  else
+    k := least(3, greatest(2, round(n / 6.0)));
+    insert into roles (player_id, game_id, role)
+    select id, p_game, case when rn <= k then 'traitor' else 'faithful' end
+    from (select id, row_number() over (order by random()) rn from players where game_id = p_game) s;
+  end if;
 
   v_anchor := coalesce(p_anchor, date_trunc('week', now() at time zone g.tz) + interval '7 days');
   -- ponytail: events are pre-generated for p_weeks (12); a game longer than that needs a top-up function.
@@ -602,6 +623,7 @@ begin
     'slack_on', exists (select 1 from app_config where key = 'slack_webhook'),
     'people', coalesce((select jsonb_agg(jsonb_build_object(
                 'user_id', p.user_id, 'name', p.display_name, 'email', p.email, 'avatar_key', p.avatar_key,
+                'traitor', exists (select 1 from designated_traitors d where d.game_id = p_game and d.user_id = p.user_id),
                 'in_game', exists (select 1 from players g where g.game_id = p_game and g.user_id = p.user_id))
                 order by p.display_name) from people p), '[]'),
     'events', coalesce((select jsonb_agg(to_jsonb(e) order by e.opens_at)
@@ -609,12 +631,26 @@ begin
                               order by opens_at limit 8) e), '[]'));
 end $$;
 
+create or replace function gm_set_traitor(p_game uuid, p_user uuid, p_on boolean) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  if (select status from games where id = p_game) is distinct from 'lobby' then raise exception 'game not in lobby'; end if;
+  if not exists (select 1 from players where game_id = p_game and user_id = p_user) then raise exception 'That person is not in this game'; end if;
+  if p_on then
+    insert into designated_traitors (game_id, user_id) values (p_game, p_user) on conflict do nothing;
+  else
+    delete from designated_traitors where game_id = p_game and user_id = p_user;
+  end if;
+end $$;
+
+revoke execute on function gm_set_traitor(uuid, uuid, boolean) from public, anon;
+grant execute on function gm_set_traitor(uuid, uuid, boolean) to authenticated;
+
 create or replace function gm_set_player(p_game uuid, p_user uuid, p_in boolean) returns void language plpgsql security definer set search_path = public as $$
 begin
   if not is_admin() then raise exception 'admin only'; end if;
   if (select status from games where id = p_game) is distinct from 'lobby' then raise exception 'game not in lobby'; end if;
   if p_in then
-    if (select count(*) from players where game_id = p_game) >= 15 then raise exception 'game full'; end if;
     insert into players (game_id, user_id, email, display_name, avatar_key)
     select p_game, user_id, email, display_name, avatar_key from people where user_id = p_user
     on conflict (game_id, user_id) do nothing;

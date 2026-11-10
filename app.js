@@ -5,7 +5,7 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const app = document.getElementById('app');
 const S = { user: null, admin: false, game: null, me: null, players: [], roles: {}, events: [], results: {},
-            messages: [], mine: {}, picks: {}, overview: null, dash: null, secrets: null, gmchat: [], curtain: false, person: null, gallery: [], picking: false, gmPick: null, tab: 'game', error: '', notice: '', authTab: 'signin', peek: false, offer: null };
+            messages: [], mine: {}, picks: {}, overview: null, dash: null, secrets: null, gmchat: [], curtain: false, person: null, gallery: [], picking: false, skipPhoto: false, gmPick: null, tab: 'game', error: '', notice: '', authTab: 'signin', peek: false, offer: null };
 
 // Display names come from Google profiles, so every interpolated value goes through esc().
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -78,8 +78,10 @@ function pickerView() {
     ${g.taken ? 'disabled' : ''} aria-label="Photo ${esc(g.key)}${g.taken ? ', already taken' : ''}"><img src="avatars/${esc(g.key)}.webp" alt=""></button>`).join('');
   return `<h2 style="margin-top:0">${changing ? 'Change your photo' : 'Choose your photo'}</h2>
     <p class="muted">${changing ? 'Pick a new one. Yours is outlined.' : 'Which one is you? This is how everyone in the game will see you.'} Greyed-out photos have been taken.</p>
-    <div class="gallery">${tiles || '<p class="muted">No photos are available yet.</p>'}</div>
-    ${changing ? '<div class="gm-actions"><button class="ghost" data-act="keepphoto">Keep my photo</button></div>' : ''}`;
+    <div class="gallery">${tiles}</div>
+    ${!changing && !S.gallery.some(g => !g.taken) ? '<p class="warn">Every photo has been taken. Ask the game master to add yours. You can carry on with your initial for now.</p>' : ''}
+    ${changing ? '<div class="gm-actions"><button class="ghost" data-act="keepphoto">Keep my photo</button></div>'
+      : !S.gallery.some(g => !g.taken) ? '<div class="gm-actions"><button data-act="skipphoto">Continue with my initial</button></div>' : ''}`;
 }
 
 function playerGrid() {
@@ -186,6 +188,23 @@ function gmPickerView() {
     ${has ? '<button class="ghost" data-act="gmphotoremove">Remove their photo</button>' : ''}</div>`;
 }
 
+// The GM decides who the traitors are, from the people already ticked into the game. Nothing ticked means random.
+function traitorPicker() {
+  const o = S.overview;
+  const players = (o?.people ?? []).filter(p => p.in_game);
+  if (!players.length) return '';
+  const n = players.length, chosen = players.filter(p => p.traitor).length;
+  const tooMany = chosen > 0 && chosen >= n - chosen;
+  const note = tooMany ? `${chosen} of ${n} is too many: there must be fewer traitors than faithful.`
+    : chosen ? `${chosen} traitor${chosen === 1 ? '' : 's'} chosen, ${n - chosen} faithful.`
+    : `Nobody chosen, so ${Math.min(3, Math.max(2, Math.round(n / 6)))} will be picked at random when you start.`;
+  const rows = players.map(p => `<label class="pick"><input type="checkbox" data-act="traitor" data-user="${esc(p.user_id)}" ${p.traitor ? 'checked' : ''}>
+    ${avatar({ display_name: p.name, avatar_key: p.avatar_key }, 'sm')} ${esc(p.name)}</label>`).join('');
+  return `<div class="card"><h3>Choose the traitors</h3>
+    <p class="muted">Tick who the traitors are. Players only learn their role when you press Start.</p>
+    ${rows}<p class="${tooMany ? 'warn' : 'muted'}">${note}</p></div>`;
+}
+
 function dashboard() {
   const d = S.dash;
   if (!d || S.game.status !== 'active') return '';
@@ -279,11 +298,11 @@ function view() {
       <div class="foot"><img src="assets/dev-logo.svg" alt="DEV" width="124" height="56"></div></div>`;
   }
   if (S.admin && S.gmPick) return gmPickerView();
-  if (!S.admin && S.person && (!S.person.avatar_key || S.picking)) return pickerView();
+  if (!S.admin && S.person && ((!S.person.avatar_key && !S.skipPhoto) || S.picking)) return pickerView();
   const g = S.game;
   if (!g) return S.admin ? `<p>No game yet.</p><button data-act="create">Create game</button>` : `<p>No game yet. Check back soon.</p>`;
   if (g.status === 'lobby') {
-    if (S.admin) return `<h2>Lobby</h2>${gmPanel()}<button data-act="start">Start game</button>`;
+    if (S.admin) return `<h2>Lobby</h2>${gmPanel()}${traitorPicker()}<button data-act="start">Start game</button>`;
     return S.me ? `<h2>Lobby</h2><p class="muted">Waiting for the game master to start.</p>${playerGrid()}`
                 : `<p>You haven't been added to this game yet. Ask the game master.</p>`;
   }
@@ -304,7 +323,7 @@ function render() {
   const keep = {};
   app.querySelectorAll('select,input').forEach(e => { keep[e.id] = e.value; });
   const focus = document.activeElement?.id;
-  const header = S.user ? `<div class="bar"><span class="who"><span class="muted">${esc(S.user.email)}</span>${S.person?.avatar_key && !S.picking ? '<button class="ghost" data-act="changephoto">Change photo</button>' : ''}<button class="ghost" data-act="logout">Sign out</button></span></div>` : '';
+  const header = S.user ? `<div class="bar"><span class="who"><span class="muted">${esc(S.user.email)}</span>${S.person && (S.person.avatar_key || S.skipPhoto) && !S.picking ? `<button class="ghost" data-act="changephoto">${S.person.avatar_key ? 'Change photo' : 'Choose photo'}</button>` : ''}<button class="ghost" data-act="logout">Sign out</button></span></div>` : '';
   app.innerHTML = header + (S.error ? `<div class="error">${esc(S.error)}</div>` : '')
     + (S.notice ? `<div class="notice">${esc(S.notice)}</div>` : '') + view()
     + (S.user ? `<footer class="site-foot"><img src="assets/dev-x-traitors.svg" alt="DEV x Traitors" width="233" height="60"></footer>` : '');
@@ -379,6 +398,7 @@ const actions = {
     await call('set_my_photo', { p_key: el.dataset.key });
     if (!S.error) { S.picking = false; await refresh(); }
   },
+  skipphoto: () => { S.skipPhoto = true; render(); },
   keepphoto: () => { S.picking = false; render(); },
   changephoto: async () => { S.picking = true; await refresh(); },
   choosephoto: async el => {
@@ -398,6 +418,7 @@ const actions = {
     if (!S.error) { S.gmPick = null; await refresh(); }
   },
   gmphotocancel: () => { S.gmPick = null; render(); },
+  traitor: el => call('gm_set_traitor', { p_game: S.game.id, p_user: el.dataset.user, p_on: el.checked }),
   toggle: el => call('gm_set_player', { p_game: S.game.id, p_user: el.dataset.user, p_in: el.checked }),
   logout: () => sb.auth.signOut().then(refresh),
   create: () => call('create_game'),

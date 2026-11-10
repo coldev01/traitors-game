@@ -9,6 +9,10 @@
 5. On a scratch project only, run `db/tests.sql`. It should end with `all tests passed`.
 6. Project Settings → API: copy the URL and anon key into the top of `app.js`. The anon key is meant to be public; never put the service_role key anywhere in the repo.
 
+## 1a. Choosing the traitors and the game size
+
+In the lobby, after ticking who is playing (there is no upper limit), a **Choose the traitors** card lists those players. Tick the traitors yourself: any number, as long as there are fewer traitors than faithful (the Start button is refused otherwise). Nobody can see your choice, and players only learn their role when you press Start. If you tick nobody, 2 or 3 are picked at random.
+
 ## 2. How people get in
 
 - **Once:** the GM posts the app URL and the signup code (both shown in the GM panel). Each person opens the URL, picks **Register**, and enters their name, dev email, a password and the code. That creates their account permanently.
@@ -41,6 +45,7 @@ drop function if exists traitor_picks(uuid);
 
 The 21 team photos are in `avatars/team-01.webp` to `team-21.webp` (320px, about 11KB each). Nobody's photo is assigned in advance: after registering, each person is shown the gallery and picks theirs ("Which one is you?"). A photo can belong to only one person, taken ones are greyed out, and people can change theirs later with **Change photo** in the top bar. In the GM panel each person's thumbnail shows next to their name, with a **Choose photo** / **Change photo** button: you can give anyone a photo yourself (same rule, one photo per person, so a photo someone else holds is greyed out), or remove theirs so they choose again.
 
+- **More people than photos:** each photo can belong to only one person, so once all 21 are taken, newcomers see a notice and carry on with their initial (they keep a **Choose photo** button for later). Add photos below as the team grows.
 - **Add a photo:** put `team-18.webp` in `avatars/` and run `insert into photos (key) values ('team-18');`.
 - **Pre-assign photos in bulk:** use **Choose photo** per person in the GM panel, or a one-off `update people set avatar_key = 'team-07' where email = '...';`.
 - Photos are only fetched for the people in a game plus the gallery, so the images add little to page load.

@@ -236,18 +236,19 @@ select tests.throws(format($$select gm_set_player(%L, %L, false)$$, tests.g(), t
 select tests.reset();
 rollback to savepoint s2;
 
--------------------------------------------------------------------- 2b. limits
+-------------------------------------------------------------------- 2b. no upper limit on players
 savepoint s2b;
 insert into admins values ('gm@org.test');
 select tests.make_user('gm');
-select tests.add_people(16);
+select tests.add_people(30);
 select tests.act_as('gm');
 select set_config('t.g', create_game()::text, false);
-select tests.lives(format($$select gm_set_player(%L, %L, true)$$, tests.g(), tests.uid('p' || i)), 'select p' || i) from generate_series(1, 15) i;
-select tests.throws(format($$select gm_set_player(%L, %L, true)$$, tests.g(), tests.uid('p16')), 'game full', '16th player rejected');
+-- new people may join at any time, so there is no cap: thirty players all go in
+select tests.lives(format($$select gm_set_player(%L, %L, true)$$, tests.g(), tests.uid('p' || i)), 'select p' || i) from generate_series(1, 30) i;
 select tests.reset();
 select internal_start_game(tests.g(), '2026-10-19'::timestamp, '[]'::jsonb, 1, 10080);
-select tests.eq((select count(*) from roles where game_id = tests.g() and role = 'traitor'), 4::bigint, '15 players -> 4 traitors');
+select tests.eq((select count(*) from roles where game_id = tests.g() and role = 'traitor'), 3::bigint, '30 players, none chosen -> still 3 random traitors');
+select tests.eq((select count(*) from players where game_id = tests.g()), 30::bigint, 'all thirty are in the game');
 rollback to savepoint s2b;
 
 -------------------------------------------------------------------- 3. actions
@@ -773,6 +774,107 @@ select tests.ok((select (x ->> 'taken')::boolean from jsonb_array_elements(gm_ga
 select tests.ok((select (x ->> 'mine')::boolean from jsonb_array_elements(gm_gallery(tests.uid('p3'))) x where x ->> 'key' = 'team-13'), 'and the person''s own as theirs');
 select tests.reset();
 rollback to savepoint s12;
+
+-------------------------------------------------------------------- 13. the GM chooses the traitors
+savepoint s13;
+insert into admins values ('gm@org.test');
+select tests.make_user('gm');
+select tests.add_people(18);
+select tests.act_as('gm');
+select set_config('t.g', create_game()::text, false);
+select gm_set_player(tests.g(), tests.uid('p' || i), true) from generate_series(1, 18) i;
+
+-- only the GM, only in the lobby, only people in this game
+select tests.act_as('p1');
+select tests.throws(format($$select gm_set_traitor(%L, %L, true)$$, tests.g(), tests.uid('p2')), 'admin only', 'players cannot choose traitors');
+select tests.act_as('gm');
+select tests.throws(format($$select gm_set_traitor(%L, %L, true)$$, tests.g(), tests.uid('gm')), 'not in this game', 'cannot choose someone who is not playing');
+select tests.lives(format($$select gm_set_traitor(%L, %L, true)$$, tests.g(), tests.uid('p4')), 'the GM chooses a traitor');
+select tests.lives(format($$select gm_set_traitor(%L, %L, true)$$, tests.g(), tests.uid('p9')), 'and another');
+select tests.lives(format($$select gm_set_traitor(%L, %L, true)$$, tests.g(), tests.uid('p17')), 'and a third');
+select tests.lives(format($$select gm_set_traitor(%L, %L, true)$$, tests.g(), tests.uid('p9')), 'choosing twice is harmless');
+select tests.lives(format($$select gm_set_traitor(%L, %L, false)$$, tests.g(), tests.uid('p17')), 'a choice can be undone');
+select tests.lives(format($$select gm_set_traitor(%L, %L, true)$$, tests.g(), tests.uid('p17')), 'and made again');
+select set_config('t.o', gm_overview(tests.g())::text, false);
+select tests.reset();
+select tests.eq((select count(*) from jsonb_array_elements(current_setting('t.o')::jsonb -> 'people') x where (x ->> 'traitor')::boolean), 3::bigint, 'the GM overview shows the three chosen');
+
+-- players can never read who was chosen
+select tests.act_as('p1');
+select tests.eq((select count(*) from designated_traitors), 0::bigint, 'players cannot read the chosen traitors');
+select tests.eq((select count(*) from players where game_id = tests.g()), 18::bigint, 'but they can still see the player list');
+select tests.reset();
+
+-- starting uses exactly the GM's choice, whatever the count
+select tests.act_as('gm');
+select start_game(tests.g(), '2026-10-19');
+select tests.reset();
+select tests.eq((select count(*) from roles where game_id = tests.g() and role = 'traitor'), 3::bigint, 'exactly three traitors');
+select tests.eq((select array_agg(p.display_name order by p.display_name) from roles r join players p on p.id = r.player_id where r.game_id = tests.g() and r.role = 'traitor'),
+                array['p17', 'p4', 'p9'], 'and they are the three the GM chose');
+select tests.act_as('gm');
+select tests.throws(format($$select gm_set_traitor(%L, %L, true)$$, tests.g(), tests.uid('p2')), 'not in lobby', 'no changing traitors once started');
+select tests.reset();
+rollback to savepoint s13;
+
+-- the GM can choose any number, as long as the faithful outnumber them
+savepoint s13b;
+insert into admins values ('gm@org.test');
+select tests.make_user('gm');
+select tests.add_people(8);
+select tests.act_as('gm');
+select set_config('t.g', create_game()::text, false);
+select gm_set_player(tests.g(), tests.uid('p' || i), true) from generate_series(1, 8) i;
+select gm_set_traitor(tests.g(), tests.uid('p' || i), true) from generate_series(1, 4) i;
+select tests.throws(format($$select start_game(%L, '2026-10-19')$$, tests.g()), 'fewer traitors than faithful', 'four traitors of eight is refused');
+select gm_set_traitor(tests.g(), tests.uid('p4'), false);
+select start_game(tests.g(), '2026-10-19');
+select tests.reset();
+select tests.eq((select count(*) from roles where game_id = tests.g() and role = 'traitor'), 3::bigint, 'three of eight is allowed');
+rollback to savepoint s13b;
+
+-- one traitor is allowed too, since the GM is in charge
+savepoint s13c;
+insert into admins values ('gm@org.test');
+select tests.make_user('gm');
+select tests.add_people(6);
+select tests.act_as('gm');
+select set_config('t.g', create_game()::text, false);
+select gm_set_player(tests.g(), tests.uid('p' || i), true) from generate_series(1, 6) i;
+select gm_set_traitor(tests.g(), tests.uid('p2'), true);
+select start_game(tests.g(), '2026-10-19');
+select tests.reset();
+select tests.eq((select count(*) from roles where game_id = tests.g() and role = 'traitor'), 1::bigint, 'a single chosen traitor is respected');
+rollback to savepoint s13c;
+
+-- nothing chosen: random, 3 for a big game, 2 for a small one
+savepoint s13d;
+insert into admins values ('gm@org.test');
+select tests.make_user('gm');
+select tests.add_people(18);
+select tests.act_as('gm');
+select set_config('t.g', create_game()::text, false);
+select gm_set_player(tests.g(), tests.uid('p' || i), true) from generate_series(1, 18) i;
+select start_game(tests.g(), '2026-10-19');
+select tests.reset();
+select tests.eq((select count(*) from roles where game_id = tests.g() and role = 'traitor'), 3::bigint, '18 players, none chosen -> 3 random traitors');
+rollback to savepoint s13d;
+
+-- a stale choice for someone no longer in the game is ignored
+savepoint s13e;
+insert into admins values ('gm@org.test');
+select tests.make_user('gm');
+select tests.add_people(7);
+select tests.act_as('gm');
+select set_config('t.g', create_game()::text, false);
+select gm_set_player(tests.g(), tests.uid('p' || i), true) from generate_series(1, 7) i;
+select gm_set_traitor(tests.g(), tests.uid('p7'), true);
+select gm_set_player(tests.g(), tests.uid('p7'), false);
+select gm_set_player(tests.g(), tests.uid('p' || i), true) from generate_series(1, 6) i;
+select start_game(tests.g(), '2026-10-19');
+select tests.reset();
+select tests.eq((select count(*) from roles where game_id = tests.g() and role = 'traitor'), 2::bigint, 'a choice for someone who left is ignored, so it falls back to random');
+rollback to savepoint s13e;
 
 -------------------------------------------------------------------- 5. security / GM
 savepoint s5;

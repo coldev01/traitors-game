@@ -23,11 +23,11 @@ An asynchronous Traitors-style social deduction game for the org, played over we
 | Login | Google SSO via Supabase Auth, restricted to the org domain |
 | Updates | Client polls ~every 10s |
 | Game master | Admin allowlist of Google emails. Not a player. Creates/starts games, extends or force-resolves stuck events |
-| Players | 6–15 per game |
-| Traitors | `max(2, round(players / 4))` |
+| Players | 6 or more, with no upper limit, chosen by the GM from the registered people (new people can register at any time) |
+| Traitors | Chosen by the GM in the lobby, any number as long as there are fewer traitors than faithful. Stored where players cannot read it, and turned into roles when the game starts. If the GM ticks nobody: 2 or 3 at random (a sixth of the players, between 2 and 3) |
 | Public chat | Dropped from v1; Slack instead |
 | Traitors chat | In game, readable/writable by traitors only |
-| Avatars | Team headshots bundled as static assets (`avatars/team-NN.webp`). Each person chooses theirs from a gallery after registering; one photo per person, changeable later. The GM can also give anyone a photo or remove it. Initial letter shown until chosen |
+| Avatars | Team headshots bundled as static assets (`avatars/team-NN.webp`). Each person chooses theirs from a gallery after registering; one photo per person, changeable later. The GM can also give anyone a photo or remove it. Initial letter shown until chosen. If every photo is taken, a new person carries on with their initial until a photo is added |
 | Vote tie | Broken at random among tied players |
 | Role reveal | Banished and murdered players' roles are shown to everyone |
 | Dead players | Can't act or post |
