@@ -5,7 +5,7 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const app = document.getElementById('app');
 const S = { user: null, admin: false, game: null, me: null, players: [], roles: {}, events: [], results: {},
-            messages: [], mine: {}, picks: {}, overview: null, tab: 'game', error: '', notice: '', authTab: 'signin', peek: false, offer: null };
+            messages: [], mine: {}, picks: {}, overview: null, dash: null, secrets: null, gmchat: [], curtain: false, tab: 'game', error: '', notice: '', authTab: 'signin', peek: false, offer: null };
 
 // Display names come from Google profiles, so every interpolated value goes through esc().
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -49,7 +49,14 @@ async function loadGame() {
     if (e.kind === 'murder' && S.roles[S.me.id] === 'traitor') S.picks[e.id] = (await sb.rpc('team_picks', { p_event: e.id })).data ?? [];
   }
   if (S.me?.alive) S.offer = (await sb.rpc('my_offer', { p_game: g })).data ?? null;
-  if (S.admin) S.overview = (await sb.rpc('gm_overview', { p_game: g })).data;
+  if (S.admin) {
+    S.overview = (await sb.rpc('gm_overview', { p_game: g })).data;
+    S.dash = (await sb.rpc('gm_dashboard', { p_game: g })).data;
+    if (S.curtain) {
+      S.secrets = (await sb.rpc('gm_secrets', { p_game: g })).data;
+      S.gmchat = (await sb.rpc('gm_chat', { p_game: g })).data ?? [];
+    }
+  }
 }
 
 async function call(fn, args) {
@@ -145,17 +152,72 @@ function roleCard(role) {
 }
 
 function chat() {
-  return `<div class="chat" id="log">${S.messages.map(m => `<p><b>${esc(name(m.player_id))}</b>: ${esc(m.body)}</p>`).join('')}</div>
+  return `<div class="chat" id="log">${S.messages.map(m => `<p><b>${m.from_gm ? 'Game master' : esc(name(m.player_id))}</b>: ${esc(m.body)}</p>`).join('')}</div>
     <div class="row" style="margin-top:12px"><input id="chat" maxlength="500" placeholder="Message fellow traitors"><button data-act="send">Send</button></div>`;
+}
+
+function dashboard() {
+  const d = S.dash;
+  if (!d || S.game.status !== 'active') return '';
+  const label = e => e.kind === 'banishment' ? 'Banishment vote' : 'Murder window';
+  const controls = e => `<div class="row"><button class="ghost" data-act="close" data-ev="${esc(e.id)}">Close now</button>
+    <button class="ghost" data-act="extend" data-ev="${esc(e.id)}" data-by="6 hours">Add 6 hours</button>
+    <button class="ghost" data-act="extend" data-ev="${esc(e.id)}" data-by="1 day">Add a day</button>
+    ${e.kind === 'banishment' ? `<button class="ghost" data-act="remind" data-ev="${esc(e.id)}">Nudge on Slack</button>` : ''}
+    <button class="ghost" data-act="skip" data-ev="${esc(e.id)}">Skip, no result</button></div>`;
+  let nextShown = false;
+  const items = d.events.map(e => {
+    if (e.status === 'scheduled') {
+      if (nextShown) return '';
+      nextShown = true;
+      return `<div class="dash-item"><b>Up next: ${label(e).toLowerCase()}</b><p class="muted">Opens in ${countdown(e.opens_at)}</p></div>`;
+    }
+    if (e.status === 'closed') {
+      return `<div class="dash-item"><b>${label(e)} closed</b><p class="muted">Result announced in ${countdown(e.reveals_at)}</p></div>`;
+    }
+    // Participation only: for murders the GM sees how many traitors have chosen, never who or what.
+    const done = e.kind === 'banishment' ? e.voted : e.picked, total = e.kind === 'banishment' ? e.voters : e.traitors;
+    const pct = total ? Math.round(100 * done / total) : 0;
+    const who = e.kind === 'banishment'
+      ? (e.not_voted.length ? `<p class="muted">Still to vote: ${e.not_voted.map(esc).join(', ')}</p>` : '<p class="muted">Everyone has voted.</p>')
+      : '';
+    return `<div class="dash-item"><b>${label(e)}</b>
+      <p class="muted">${done} of ${total} ${e.kind === 'banishment' ? 'have voted' : 'traitors have chosen'}. Closes in ${countdown(e.closes_at)}</p>
+      <div class="meter"><i style="width:${pct}%"></i></div>${who}${controls(e)}</div>`;
+  }).join('');
+  const turnout = d.history.length ? `<p class="muted">Recent votes, newest first: ${d.history.map(h => `${h.voted} voted`).join(', ')}</p>` : '';
+  return `<div class="card"><h3>Right now</h3>
+    <div class="stats"><div><b>${d.alive}</b><span>alive</span></div><div><b>${d.out}</b><span>out</span></div></div>
+    ${items || '<p class="muted">Nothing is scheduled.</p>'}${turnout}
+    <div class="dash-item"><b>Delay the whole game</b><p class="muted">Moves every event still to come, for a holiday or an outage.</p>
+      <div class="row"><button class="ghost" data-act="shift" data-by="1 day">Delay a day</button>
+      <button class="ghost" data-act="shift" data-by="2 days">Delay 2 days</button></div></div></div>`;
+}
+
+// Everything, including roles and picks. Hidden until asked for so the GM never spoils themself by accident.
+function curtain() {
+  if (!S.curtain) return `<div class="card"><h3>Behind the curtain</h3><p class="muted">Roles, every vote and pick, recruit offers and the traitors chat.</p>
+    <button class="ghost" data-act="curtain">Show</button></div>`;
+  const sec = S.secrets;
+  if (!sec) return `<div class="card"><h3>Behind the curtain</h3><p class="muted">Loading…</p></div>`;
+  const roleTag = p => p.role ? `<span class="tag ${esc(p.role)}">${esc(p.role)}</span>` : '';
+  const players = sec.players.map(p => `<p class="${p.alive ? '' : 'muted'}">${p.alive ? '' : '<s>'}${esc(p.name)}${p.alive ? '' : '</s>'} ${roleTag(p)}</p>`).join('');
+  const picks = sec.picks.map(k => `<p>${k.event_kind === 'banishment' ? 'Vote' : 'Traitor pick'}: <b>${esc(k.who)}</b> → ${esc(k.target ? `${k.kind === 'recruit' ? 'recruit ' : ''}${k.target}` : 'nobody')}</p>`).join('');
+  const offers = sec.offers.map(o => `<p>Recruit offer to <b>${esc(o.target)}</b>: ${o.accepted === null ? 'waiting for an answer' : o.accepted ? 'accepted' : 'refused'}</p>`).join('');
+  const chat = S.gmchat.map(m => `<p><b>${esc(m.who)}</b>: ${esc(m.body)}</p>`).join('') || '<p class="muted">No messages yet.</p>';
+  return `<div class="card"><h3>Behind the curtain</h3>
+    <div class="dash-item"><b>Players and roles</b>${players}</div>
+    <div class="dash-item"><b>Open picks</b>${picks || '<p class="muted">Nothing chosen yet.</p>'}${offers}</div>
+    <div class="dash-item"><b>Traitors chat</b><div class="chat" id="log">${chat}</div>
+      <div class="row" style="margin-top:12px"><input id="gmchat" maxlength="500" placeholder="Speak to the traitors as the Game master" autocomplete="off">
+      <button data-act="gmsend">Send</button></div></div>
+    <div class="gm-actions"><button class="ghost" data-act="curtain">Hide</button></div></div>`;
 }
 
 function gmPanel() {
   const o = S.overview;
   if (!o) return '';
   const lobby = S.game.status === 'lobby';
-  const evs = o.events.map(e => `<p>${esc(e.kind)}, ${esc(e.status)}. Closes in ${countdown(e.closes_at)}</p>
-    <div class="row"><button class="ghost" data-act="close" data-ev="${esc(e.id)}">Close now</button>
-    <button class="ghost" data-act="extend" data-ev="${esc(e.id)}">Add a day</button></div>`).join('');
   const people = o.people.map(p => `<label class="pick"><input type="checkbox" data-act="toggle" data-user="${esc(p.user_id)}"
     ${p.in_game ? 'checked' : ''} ${lobby ? '' : 'disabled'}> ${esc(p.name)} <span class="muted">${esc(p.email)}</span></label>`).join('');
   return `<div class="card"><h3>Game master</h3>
@@ -163,7 +225,6 @@ function gmPanel() {
     <div class="share"><b>${esc(location.origin + location.pathname)}</b><br>Signup code: <b>${esc(o.signup_code ?? '(not set)')}</b></div>
     <p class="muted">${o.players} selected for this game${lobby ? '. Tick the people who are playing.' : '.'}</p>
     ${people || '<p class="muted">Nobody has registered yet.</p>'}
-    ${S.game.status === 'active' ? `<h3 style="margin-top:20px">Open events</h3>${evs}` : ''}
     <h3 style="margin-top:20px">Slack announcements</h3>
     <p class="muted">${o.slack_on ? 'Connected. Votes opening, reminders, results and the final outcome are posted.' : 'Not connected. Paste a Slack webhook URL to post public updates to a channel.'}</p>
     <div class="row"><input id="slackurl" placeholder="https://hooks.slack.com/..." autocomplete="off">
@@ -196,7 +257,7 @@ function view() {
   if (g.status === 'finished') {
     return `<div class="winner ${esc(g.winner)}"><h1>${g.winner === 'faithful' ? 'The Faithful win' : 'The Traitors win'}</h1></div>${playerGrid()}<h2>What happened</h2>${timeline()}${S.admin ? gmPanel() : ''}${S.admin ? '<button data-act="create">New game</button>' : ''}`;
   }
-  if (S.admin) return `<h2>Game in progress</h2>${gmPanel()}`;
+  if (S.admin) return `<h2>Game in progress</h2>${dashboard()}${curtain()}${gmPanel()}`;
   if (!S.me) return `<p>A game is in progress and you're not in it.</p>`;
   const role = S.roles[S.me.id], isTraitor = role === 'traitor';
   const tabs = isTraitor ? `<div class="seg" style="margin:0 0 20px"><button class="ghost ${S.tab === 'game' ? 'active' : ''}" data-act="tab" data-tab="game">Game</button>
@@ -268,6 +329,19 @@ const actions = {
     await call('gm_slack_test');
     if (!S.error) { S.notice = 'Test message sent. Check the channel.'; render(); }
   },
+  shift: el => confirm(`Delay every remaining event by ${el.dataset.by}?`) && call('gm_shift_game', { p_game: S.game.id, p_by: el.dataset.by }),
+  skip: el => confirm('Skip this event? All picks are discarded and nobody is banished or murdered.') && call('gm_skip_event', { p_event: el.dataset.ev }),
+  remind: async el => {
+    await call('gm_remind', { p_event: el.dataset.ev });
+    if (!S.error) { S.notice = 'Posted the list of players still to vote to Slack.'; render(); }
+  },
+  curtain: async () => { S.curtain = !S.curtain; await refresh(); },
+  gmsend: async () => {
+    const box = document.getElementById('gmchat'), body = box.value.trim();
+    if (!body) return;
+    box.value = '';
+    await call('gm_post_message', { p_game: S.game.id, p_body: body });
+  },
   toggle: el => call('gm_set_player', { p_game: S.game.id, p_user: el.dataset.user, p_in: el.checked }),
   logout: () => sb.auth.signOut().then(refresh),
   create: () => call('create_game'),
@@ -290,7 +364,7 @@ const actions = {
     if (!S.error) { S.notice = 'You refused. Nothing happens.'; render(); }
   },
   close: el => call('gm_force_close', { p_event: el.dataset.ev }),
-  extend: el => call('gm_extend_event', { p_event: el.dataset.ev, p_by: '1 day' }),
+  extend: el => call('gm_extend_event', { p_event: el.dataset.ev, p_by: el.dataset.by || '1 day' }),
   delete: () => confirm('Delete this game and all its data?') && call('gm_delete_game', { p_game: S.game.id }),
   tab: el => { S.tab = el.dataset.tab; render(); },
   send: () => {
@@ -317,10 +391,12 @@ document.addEventListener('click', async e => {
     render();
   } finally {
     busy = false;
+    // A cancelled confirm() re-renders nothing, so the button would otherwise stay disabled.
+    el.disabled = false;
   }
 });
 document.addEventListener('keydown', e => {
-  if (e.key === 'Enter') ({ chat: actions.send, pw: actions.login })[e.target.id]?.();
+  if (e.key === 'Enter') ({ chat: actions.send, pw: actions.login, gmchat: actions.gmsend })[e.target.id]?.();
 });
 
 sb.auth.onAuthStateChange(() => setTimeout(refresh, 0));

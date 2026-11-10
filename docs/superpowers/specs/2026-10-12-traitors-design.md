@@ -75,7 +75,10 @@ Banishment and murder are two interleaved tracks, not a single day/night sequenc
 - **Lobby** — player photo grid; Start button for the game master.
 - **Game** — player grid (alive/dead, avatars), current events with countdowns, traitors chat tab (traitors only), action panel (vote / pick victim), own role card.
 - **End** — winner and full role reveal.
-- **GM panel** — create/start game, extend or force-resolve an event. Control panel only, not a roles view.
+- **GM panel** — the GM is the game runner, not a player, and (as database owner) can see everything anyway, so the panel gives full control:
+  - **Right now:** alive/out counts, who still has to vote, how many traitors have chosen, countdowns and recent turnout. Participation only, with no roles or targets, so it is safe to glance at.
+  - **Controls:** pick who plays, close an event now, add 6 hours or a day, skip an event with no result, delay the whole game by 1-14 days, and nudge the players who have not voted on Slack.
+  - **Behind the curtain** (hidden until opened): every role, every vote and pick, recruit offers, and the traitors chat, with the ability to post in it as the Game master.
 
 `Avatar` is a single scene taking an `avatar_key`; today it shows a still photo, later it can show an animated character.
 

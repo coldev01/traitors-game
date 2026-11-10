@@ -131,3 +131,13 @@ button.active { border-color: var(--orange); color: var(--orange); }
 .winner.traitors h1 { color: var(--seal); }
 .winner.faithful h1 { color: var(--faithful); }
 .warn { color: var(--orange); margin: 10px 0 0; font-weight: 500; }
+
+/* GM dashboard */
+.stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin: 8px 0 16px; }
+.stats div { background: var(--panel-2); border-radius: 10px; padding: 10px 14px; }
+.stats b { display: block; font: 1.8rem/1.1 var(--display); letter-spacing: .04em; }
+.stats span { color: var(--muted); font-size: .9rem; }
+.dash-item { border-top: 1px solid var(--line); padding: 14px 0 6px; }
+.dash-item p { margin: 4px 0 8px; }
+.meter { height: 8px; border-radius: 99px; background: var(--panel-2); overflow: hidden; margin-bottom: 10px; }
+.meter i { display: block; height: 100%; background: var(--orange); border-radius: 99px; }

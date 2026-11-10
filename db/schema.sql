@@ -82,6 +82,10 @@ alter table actions add column if not exists kind text not null default 'kill' c
 alter table event_results add column if not exists kind text not null default 'kill' check (kind in ('kill', 'recruit'));
 alter table event_results add column if not exists accepted boolean;
 alter table events add column if not exists reminded boolean not null default false;
+-- The GM can speak in the traitors chat. Their messages have no player, so player_id must be nullable;
+-- only post_message (player) and gm_post_message (GM) write here, so the pairing is enforced in those.
+alter table messages alter column player_id drop not null;
+alter table messages add column if not exists from_gm boolean not null default false;
 
 alter table app_config enable row level security;
 alter table admins enable row level security;
@@ -505,6 +509,138 @@ begin
     delete from players where game_id = p_game and user_id = p_user;
   end if;
 end $$;
+
+-- Participation only: who hasn't voted and how many traitors have chosen. Never what anyone chose, who the
+-- traitors are, or whether a traitor pick is a murder or a recruit, so the GM stays out of the secrets.
+create or replace function gm_dashboard(p_game uuid) returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare g games;
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  select * into g from games where id = p_game;
+  return jsonb_build_object(
+    'status', g.status,
+    'alive', (select count(*) from players where game_id = p_game and alive),
+    'out', (select count(*) from players where game_id = p_game and not alive),
+    'events', coalesce((select jsonb_agg(x order by x ->> 'opens_at') from (
+      select jsonb_build_object(
+        'id', e.id, 'kind', e.kind, 'status', e.status,
+        'opens_at', e.opens_at, 'closes_at', e.closes_at, 'reveals_at', e.reveals_at,
+        'voters', case when e.kind = 'banishment' then (select count(*) from players p where p.game_id = e.game_id and p.alive) end,
+        'voted', case when e.kind = 'banishment' then
+          (select count(*) from actions a join players p on p.id = a.player_id where a.event_id = e.id and p.alive) end,
+        'not_voted', case when e.kind = 'banishment' and e.status = 'open' then coalesce((
+          select jsonb_agg(p.display_name order by p.display_name) from players p
+          where p.game_id = e.game_id and p.alive
+            and not exists (select 1 from actions a where a.event_id = e.id and a.player_id = p.id)), '[]') end,
+        'traitors', case when e.kind = 'murder' then
+          (select count(*) from players p join roles r on r.player_id = p.id
+           where p.game_id = e.game_id and p.alive and r.role = 'traitor') end,
+        'picked', case when e.kind = 'murder' then
+          (select count(*) from actions a join players p on p.id = a.player_id join roles r on r.player_id = p.id
+           where a.event_id = e.id and p.alive and r.role = 'traitor') end
+      ) as x
+      from events e where e.game_id = p_game and e.status in ('scheduled', 'open', 'closed')
+      order by e.opens_at limit 4) s), '[]'),
+    'history', coalesce((select jsonb_agg(h order by h ->> 'at' desc) from (
+      select jsonb_build_object('at', e.closes_at,
+        'voted', (select count(*) from actions a where a.event_id = e.id)) as h
+      from events e where e.game_id = p_game and e.kind = 'banishment' and e.status = 'revealed'
+      order by e.closes_at desc limit 4) hs), '[]'));
+end $$;
+
+revoke execute on function gm_dashboard(uuid) from public, anon;
+grant execute on function gm_dashboard(uuid) to authenticated;
+
+-- Delay everything still to come, e.g. a holiday or an outage. Open windows get longer, scheduled ones start later,
+-- closed ones reveal later. Already-sent reminders are re-armed so the new deadline gets its own.
+create or replace function gm_shift_game(p_game uuid, p_by interval) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  if p_by <= interval '0' or p_by > interval '14 days' then raise exception 'Delay must be between 0 and 14 days'; end if;
+  update events set
+    opens_at = case when status = 'scheduled' then opens_at + p_by else opens_at end,
+    closes_at = case when status in ('scheduled', 'open') then closes_at + p_by else closes_at end,
+    reveals_at = reveals_at + p_by,
+    reminded = false
+  where game_id = p_game and status in ('scheduled', 'open', 'closed');
+end $$;
+
+-- Void a window: every pick is blanked (the tally ignores empty picks, and the rows stay as a record of who took
+-- part) and it closes now, so nobody is banished or murdered.
+create or replace function gm_skip_event(p_event uuid) returns void language plpgsql security definer set search_path = public as $$
+declare ev events;
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  select * into ev from events where id = p_event;
+  if ev.id is null or ev.status <> 'open' then raise exception 'Only an open event can be skipped'; end if;
+  update actions set target_id = null where event_id = p_event;
+  update events set closes_at = least(closes_at, now()), reveals_at = least(reveals_at, now()) where id = p_event;
+  perform advance_games();
+end $$;
+
+-- Posts the names of players still to vote. The GM chooses when, so naming people is their call.
+create or replace function gm_remind(p_event uuid) returns void language plpgsql security definer set search_path = public as $$
+declare ev events; v_names text; v_tz text;
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  select * into ev from events where id = p_event;
+  if ev.id is null or ev.status <> 'open' or ev.kind <> 'banishment' then
+    raise exception 'Only an open banishment vote can be reminded';
+  end if;
+  if not exists (select 1 from app_config where key = 'slack_webhook') then raise exception 'No Slack webhook is set'; end if;
+  select string_agg(p.display_name, ', ' order by p.display_name) into v_names from players p
+  where p.game_id = ev.game_id and p.alive
+    and not exists (select 1 from actions a where a.event_id = ev.id and a.player_id = p.id);
+  if v_names is null then raise exception 'Everyone has already voted'; end if;
+  select tz into v_tz from games where id = ev.game_id;
+  perform slack_post(format('Still to vote in the banishment: %s. The vote closes %s.', v_names,
+                            to_char(ev.closes_at at time zone v_tz, 'FMDay "at" HH24:MI')));
+end $$;
+
+revoke execute on function gm_shift_game(uuid, interval), gm_skip_event(uuid), gm_remind(uuid) from public, anon;
+grant execute on function gm_shift_game(uuid, interval), gm_skip_event(uuid), gm_remind(uuid) to authenticated;
+
+-- The GM runs the database and can read everything anyway, so this is the full picture: roles, every
+-- vote and pick, recruit offers. It is a separate function from gm_dashboard so the safe view stays safe.
+create or replace function gm_secrets(p_game uuid) returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  return jsonb_build_object(
+    'players', coalesce((select jsonb_agg(jsonb_build_object('id', p.id, 'name', p.display_name, 'alive', p.alive, 'role', r.role)
+                                          order by p.display_name)
+                         from players p left join roles r on r.player_id = p.id where p.game_id = p_game), '[]'),
+    'picks', coalesce((select jsonb_agg(jsonb_build_object('event_id', a.event_id, 'event_kind', e.kind, 'who', voter.display_name,
+                                                            'kind', a.kind, 'target', t.display_name)
+                                        order by e.opens_at, voter.display_name)
+                       from actions a join events e on e.id = a.event_id
+                       join players voter on voter.id = a.player_id
+                       left join players t on t.id = a.target_id
+                       where e.game_id = p_game and e.status in ('open', 'closed')), '[]'),
+    'offers', coalesce((select jsonb_agg(jsonb_build_object('event_id', r.event_id, 'target', t.display_name, 'accepted', r.accepted))
+                        from event_results r join events e on e.id = r.event_id join players t on t.id = r.target_id
+                        where r.game_id = p_game and r.kind = 'recruit' and e.status = 'closed'), '[]'));
+end $$;
+
+create or replace function gm_chat(p_game uuid) returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  return coalesce((select jsonb_agg(jsonb_build_object(
+      'who', case when m.from_gm then 'Game master' else p.display_name end,
+      'body', m.body, 'at', m.created_at, 'from_gm', m.from_gm) order by m.created_at)
+    from (select * from messages where game_id = p_game order by created_at desc limit 200) m
+    left join players p on p.id = m.player_id), '[]');
+end $$;
+
+create or replace function gm_post_message(p_game uuid, p_body text) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  if (select status from games where id = p_game) is distinct from 'active' then raise exception 'The game is not running'; end if;
+  if char_length(trim(coalesce(p_body, ''))) = 0 then raise exception 'The message is empty'; end if;
+  insert into messages (game_id, player_id, from_gm, body) values (p_game, null, true, left(trim(p_body), 500));
+end $$;
+
+revoke execute on function gm_secrets(uuid), gm_chat(uuid), gm_post_message(uuid, text) from public, anon;
+grant execute on function gm_secrets(uuid), gm_chat(uuid), gm_post_message(uuid, text) to authenticated;
 
 create or replace function gm_set_slack(p_url text) returns void language plpgsql security definer set search_path = public as $$
 begin

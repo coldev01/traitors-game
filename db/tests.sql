@@ -488,6 +488,135 @@ select tests.eq((gm_overview(tests.g()) ->> 'slack_on')::boolean, false, 'overvi
 select tests.reset();
 rollback to savepoint s7;
 
+-------------------------------------------------------------------- 8. GM dashboard
+savepoint s8;
+select set_config('t.g', tests.make_game(8)::text, false);
+select tests.set_traitors(tests.g(), '{a,b}');
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status) values
+  ('00000000-0000-0000-0000-0000000000e8', tests.g(), 'banishment', now() - interval '1 hour', now() + interval '5 hours', now() + interval '5 hours', 'open'),
+  ('00000000-0000-0000-0000-0000000000e9', tests.g(), 'murder', now() - interval '1 hour', now() + interval '5 hours', now() + interval '9 hours', 'open');
+insert into actions (event_id, player_id, target_id) values
+  ('00000000-0000-0000-0000-0000000000e8', tests.pid(tests.g(), 'c'), tests.pid(tests.g(), 'd')),
+  ('00000000-0000-0000-0000-0000000000e8', tests.pid(tests.g(), 'd'), tests.pid(tests.g(), 'c'));
+insert into actions (event_id, player_id, target_id, kind) values
+  ('00000000-0000-0000-0000-0000000000e9', tests.pid(tests.g(), 'a'), tests.pid(tests.g(), 'c'), 'recruit');
+
+select tests.act_as('a');
+select tests.throws(format($$select gm_dashboard(%L)$$, tests.g()), 'admin only', 'non-GM cannot read the dashboard');
+select tests.act_as('gm');
+select set_config('t.d', gm_dashboard(tests.g())::text, false);
+select tests.reset();
+select tests.eq((current_setting('t.d')::jsonb -> 'events' -> 0 ->> 'voters')::int, 8, 'eight players can vote');
+select tests.eq((current_setting('t.d')::jsonb -> 'events' -> 0 ->> 'voted')::int, 2, 'two have voted');
+select tests.eq(jsonb_array_length(current_setting('t.d')::jsonb -> 'events' -> 0 -> 'not_voted'), 6, 'six still to vote');
+select tests.ok(not (current_setting('t.d')::jsonb -> 'events' -> 0 -> 'not_voted') ? 'c', 'a player who voted is not listed as outstanding');
+select tests.eq((current_setting('t.d')::jsonb -> 'events' -> 1 ->> 'traitors')::int, 2, 'two traitors alive');
+select tests.eq((current_setting('t.d')::jsonb -> 'events' -> 1 ->> 'picked')::int, 1, 'one traitor has chosen');
+-- Secrecy: the dashboard must not reveal what was chosen, who the traitors are, or that a pick is a recruit.
+select tests.ok(current_setting('t.d') !~ 'recruit', 'dashboard never says recruit');
+select tests.ok(current_setting('t.d') !~ 'target', 'dashboard never includes targets');
+select tests.ok(current_setting('t.d') !~ 'role', 'dashboard carries no role information');
+select tests.ok((current_setting('t.d')::jsonb -> 'events' -> 0 -> 'not_voted') ? 'a' and (current_setting('t.d')::jsonb -> 'events' -> 0 -> 'not_voted') ? 'e', 'non-voters are listed whatever their role');
+rollback to savepoint s8;
+
+-------------------------------------------------------------------- 9. GM controls: shift, skip, remind, extend
+savepoint s9;
+select set_config('t.g', tests.make_game(8)::text, false);
+select tests.set_traitors(tests.g(), '{a,b}');
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status) values
+  ('00000000-0000-0000-0000-0000000000a1', tests.g(), 'banishment', now() - interval '1 hour', now() + interval '5 hours', now() + interval '5 hours', 'open'),
+  ('00000000-0000-0000-0000-0000000000a2', tests.g(), 'murder', now() + interval '5 hours', now() + interval '20 hours', now() + interval '30 hours', 'scheduled'),
+  ('00000000-0000-0000-0000-0000000000a3', tests.g(), 'murder', now() - interval '20 hours', now() - interval '10 hours', now() + interval '2 hours', 'closed'),
+  ('00000000-0000-0000-0000-0000000000a4', tests.g(), 'banishment', now() - interval '90 hours', now() - interval '80 hours', now() - interval '80 hours', 'revealed');
+create temp table before_times as select id, opens_at, closes_at, reveals_at from events where game_id = tests.g();
+
+select tests.act_as('a');
+select tests.throws(format($$select gm_shift_game(%L, '1 day')$$, tests.g()), 'admin only', 'non-GM cannot delay the game');
+select tests.throws($$select gm_skip_event('00000000-0000-0000-0000-0000000000a1')$$, 'admin only', 'non-GM cannot skip');
+select tests.throws($$select gm_remind('00000000-0000-0000-0000-0000000000a1')$$, 'admin only', 'non-GM cannot remind');
+select tests.act_as('gm');
+select tests.throws(format($$select gm_shift_game(%L, '30 days')$$, tests.g()), 'between 0 and 14', 'delay is capped');
+select tests.throws(format($$select gm_shift_game(%L, '-1 day')$$, tests.g()), 'between 0 and 14', 'delay cannot go backwards');
+select tests.lives(format($$select gm_shift_game(%L, '1 day')$$, tests.g()), 'GM delays the game a day');
+select tests.reset();
+select tests.eq((select e.closes_at - b.closes_at from events e join before_times b using (id) where e.id = '00000000-0000-0000-0000-0000000000a1'), interval '1 day', 'open window closes a day later');
+select tests.eq((select e.opens_at = b.opens_at from events e join before_times b using (id) where e.id = '00000000-0000-0000-0000-0000000000a1'), true, 'open window keeps its start');
+select tests.eq((select e.opens_at - b.opens_at from events e join before_times b using (id) where e.id = '00000000-0000-0000-0000-0000000000a2'), interval '1 day', 'scheduled window starts a day later');
+select tests.eq((select e.reveals_at - b.reveals_at from events e join before_times b using (id) where e.id = '00000000-0000-0000-0000-0000000000a3'), interval '1 day', 'closed window reveals a day later');
+select tests.eq((select e.closes_at = b.closes_at and e.reveals_at = b.reveals_at from events e join before_times b using (id) where e.id = '00000000-0000-0000-0000-0000000000a4'), true, 'finished events are untouched');
+
+-- extend: both a day and six hours work
+select tests.act_as('gm');
+select tests.lives($$select gm_extend_event('00000000-0000-0000-0000-0000000000a1', '6 hours')$$, 'GM extends by six hours');
+select tests.reset();
+
+-- remind: needs Slack, needs someone outstanding, only for open banishments
+select tests.act_as('gm');
+select tests.throws($$select gm_remind('00000000-0000-0000-0000-0000000000a1')$$, 'No Slack webhook', 'reminder needs Slack connected');
+select gm_set_slack('https://hooks.slack.com/services/T0/B0/X');
+select tests.throws($$select gm_remind('00000000-0000-0000-0000-0000000000a2')$$, 'open banishment', 'cannot remind about a murder window');
+select tests.lives($$select gm_remind('00000000-0000-0000-0000-0000000000a1')$$, 'reminder posts (and never fails the game if Slack is down)');
+select tests.reset();
+insert into actions (event_id, player_id, target_id)
+  select '00000000-0000-0000-0000-0000000000a1', p.id, tests.pid(tests.g(), 'a') from players p where p.game_id = tests.g() and p.display_name <> 'a';
+insert into actions (event_id, player_id, target_id) values ('00000000-0000-0000-0000-0000000000a1', tests.pid(tests.g(), 'a'), tests.pid(tests.g(), 'b'));
+select tests.act_as('gm');
+select tests.throws($$select gm_remind('00000000-0000-0000-0000-0000000000a1')$$, 'Everyone has already voted', 'no reminder once everyone has voted');
+
+-- skip: discards all picks, closes now, nobody is banished
+select tests.lives($$select gm_skip_event('00000000-0000-0000-0000-0000000000a1')$$, 'GM skips the vote');
+select tests.reset();
+select tests.eq((select count(*) from actions where event_id = '00000000-0000-0000-0000-0000000000a1' and target_id is not null), 0::bigint, 'skipped event has no live picks left');
+select tests.eq((select status from events where id = '00000000-0000-0000-0000-0000000000a1'), 'revealed', 'skipped event is resolved');
+select tests.eq((select count(*) from players where game_id = tests.g() and not alive), 0::bigint, 'skipping banishes nobody');
+select tests.act_as('gm');
+select tests.throws($$select gm_skip_event('00000000-0000-0000-0000-0000000000a1')$$, 'open event', 'cannot skip an event that is already resolved');
+select tests.reset();
+rollback to savepoint s9;
+
+-------------------------------------------------------------------- 10. GM behind the curtain
+savepoint s10;
+select set_config('t.g', tests.make_game(8)::text, false);
+select tests.set_traitors(tests.g(), '{a,b}');
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status) values
+  ('00000000-0000-0000-0000-0000000000b8', tests.g(), 'banishment', now() - interval '1 hour', now() + interval '5 hours', now() + interval '5 hours', 'open'),
+  ('00000000-0000-0000-0000-0000000000b9', tests.g(), 'murder', now() - interval '1 hour', now() + interval '5 hours', now() + interval '9 hours', 'open');
+insert into actions (event_id, player_id, target_id) values
+  ('00000000-0000-0000-0000-0000000000b8', tests.pid(tests.g(), 'c'), tests.pid(tests.g(), 'd'));
+insert into actions (event_id, player_id, target_id, kind) values
+  ('00000000-0000-0000-0000-0000000000b9', tests.pid(tests.g(), 'a'), tests.pid(tests.g(), 'e'), 'recruit');
+insert into messages (game_id, player_id, body) values (tests.g(), tests.pid(tests.g(), 'a'), 'a traitor speaking');
+
+select tests.act_as('c');
+select tests.throws(format($$select gm_secrets(%L)$$, tests.g()), 'admin only', 'players cannot read the secrets');
+select tests.throws(format($$select gm_chat(%L)$$, tests.g()), 'admin only', 'players cannot read the chat through the GM function');
+select tests.throws(format($$select gm_post_message(%L, 'hi')$$, tests.g()), 'admin only', 'players cannot post as the GM');
+select tests.act_as('gm');
+select set_config('t.s', gm_secrets(tests.g())::text, false);
+select set_config('t.c', gm_chat(tests.g())::text, false);
+select tests.reset();
+select tests.eq((select count(*) from jsonb_array_elements(current_setting('t.s')::jsonb -> 'players') x where x ->> 'role' = 'traitor'), 2::bigint, 'GM sees both traitors');
+select tests.ok((select bool_or(x ->> 'kind' = 'recruit' and x ->> 'target' = 'e' and x ->> 'who' = 'a') from jsonb_array_elements(current_setting('t.s')::jsonb -> 'picks') x), 'GM sees who picked whom, including a recruit');
+select tests.ok((select bool_or(x ->> 'event_kind' = 'banishment' and x ->> 'who' = 'c' and x ->> 'target' = 'd') from jsonb_array_elements(current_setting('t.s')::jsonb -> 'picks') x), 'GM sees how people voted');
+select tests.eq(current_setting('t.c')::jsonb -> 0 ->> 'body', 'a traitor speaking', 'GM can read the traitors chat');
+
+-- the GM speaks in the chat: traitors see it, faithful do not, blanks and idle games are refused
+select tests.act_as('gm');
+select tests.lives(format($$select gm_post_message(%L, '  Welcome, traitors.  ')$$, tests.g()), 'GM posts to the traitors');
+select tests.throws(format($$select gm_post_message(%L, '   ')$$, tests.g()), 'empty', 'blank GM message refused');
+select tests.reset();
+select tests.act_as('a');
+select tests.eq((select count(*) from messages where from_gm), 1::bigint, 'a traitor sees the GM message');
+select tests.eq((select body from messages where from_gm), 'Welcome, traitors.', 'GM message is trimmed');
+select tests.act_as('c');
+select tests.eq((select count(*) from messages), 0::bigint, 'faithful still see no chat, GM messages included');
+select tests.reset();
+update games set status = 'lobby' where id = tests.g();
+select tests.act_as('gm');
+select tests.throws(format($$select gm_post_message(%L, 'hello')$$, tests.g()), 'not running', 'GM cannot post unless the game is running');
+select tests.reset();
+rollback to savepoint s10;
+
 -------------------------------------------------------------------- 5. security / GM
 savepoint s5;
 select set_config('t.g', tests.make_game(8)::text, false);
