@@ -84,8 +84,12 @@ function eventPanel(e) {
   if (!murder) {
     const targets = S.players.filter(p => p.alive && p.id !== me.id);
     const chosen = mine?.target ? name(mine.target) : 'nothing yet';
+    // A murder can land while a banishment is still open; votes for the victim are dropped at the close.
+    const stale = mine?.target && !S.players.find(p => p.id === mine.target)?.alive;
     return `<div class="slip"><h3>Vote to banish</h3>${clock}<div class="row"><select id="sel-${esc(e.id)}">${options(targets, 'Choose a player to banish', true)}</select>
-      <button data-act="vote" data-ev="${esc(e.id)}">Cast vote</button></div><p class="muted choice">Your vote: ${esc(chosen)}. No vote counts as abstaining.</p></div>`;
+      <button data-act="vote" data-ev="${esc(e.id)}">Cast vote</button></div>
+      ${stale ? `<p class="warn">Your vote was for ${esc(chosen)}, who is out of the game. It won't count. Choose again before the vote closes.</p>`
+              : `<p class="muted choice">Your vote: ${esc(chosen)}. No vote counts as abstaining.</p>`}</div>`;
   }
   if (S.roles[me.id] !== 'traitor') return '';
   const targets = S.players.filter(p => p.alive && S.roles[p.id] !== 'traitor');

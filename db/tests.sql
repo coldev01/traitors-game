@@ -362,6 +362,24 @@ select advance_games('2026-11-13 15:01+00');
 select tests.eq((select winner from games where id = tests.g()), 'traitors', 'traitors >= faithful -> traitors win');
 rollback to savepoint s4;
 
+-------------------------------------------------------------------- 4b. votes for a player who was murdered meanwhile
+savepoint s4b;
+select set_config('t.g', tests.make_game(8)::text, false);
+select tests.set_traitors(tests.g(), '{a,b}');
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at) values
+  ('00000000-0000-0000-0000-0000000000f9', tests.g(), 'banishment', now() - interval '3 hours', now() + interval '1 hour', now() + interval '1 hour');
+insert into actions (event_id, player_id, target_id) values
+  ('00000000-0000-0000-0000-0000000000f9', tests.pid(tests.g(), 'c'), tests.pid(tests.g(), 'f')),
+  ('00000000-0000-0000-0000-0000000000f9', tests.pid(tests.g(), 'd'), tests.pid(tests.g(), 'f')),
+  ('00000000-0000-0000-0000-0000000000f9', tests.pid(tests.g(), 'e'), tests.pid(tests.g(), 'g'));
+-- f (the front-runner) is murdered before the vote closes. Current rule: their votes are dropped and
+-- the next-most-voted player is banished. Change this test deliberately if that rule changes.
+update players set alive = false where id = tests.pid(tests.g(), 'f');
+select advance_games(now() + interval '2 hours');
+select tests.eq((select alive from players where id = tests.pid(tests.g(), 'g')), false, 'runner-up is banished when the front-runner was murdered');
+select tests.eq((select count(*) from players where game_id = tests.g() and not alive), 2::bigint, 'only the victim and the runner-up are out');
+rollback to savepoint s4b;
+
 -------------------------------------------------------------------- 6. recruitment
 savepoint s6;
 select set_config('t.g', tests.make_game(8)::text, false);
