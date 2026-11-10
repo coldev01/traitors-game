@@ -80,7 +80,7 @@ alter table people enable row level security;
 -- Each photo can belong to only one person.
 create table if not exists photos (key text primary key);
 alter table photos enable row level security;
-insert into photos (key) select 'team-' || lpad(n::text, 2, '0') from generate_series(1, 17) n on conflict do nothing;
+insert into photos (key) select 'team-' || lpad(n::text, 2, '0') from generate_series(1, 21) n on conflict do nothing;
 create unique index if not exists people_avatar_key_key on people (avatar_key) where avatar_key is not null;
 
 -- Recruitment: a murder window can end in a recruit offer instead of a kill. accepted stays null until
@@ -560,6 +560,34 @@ begin
   update people set avatar_key = null where user_id = p_user;
   update players set avatar_key = null where user_id = p_user;
 end $$;
+
+-- The GM can give any account a photo. Same rule as everyone: one photo per person, so a photo someone
+-- else holds is refused (reset theirs first).
+create or replace function gm_gallery(p_user uuid) returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  return coalesce((select jsonb_agg(jsonb_build_object(
+      'key', f.key,
+      'taken', exists (select 1 from people p where p.avatar_key = f.key and p.user_id <> p_user),
+      'mine', exists (select 1 from people p where p.avatar_key = f.key and p.user_id = p_user)) order by f.key)
+    from photos f), '[]');
+end $$;
+
+create or replace function gm_set_photo(p_user uuid, p_key text) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  if not exists (select 1 from people where user_id = p_user) then raise exception 'No such person'; end if;
+  if not exists (select 1 from photos where key = p_key) then raise exception 'That photo does not exist'; end if;
+  begin
+    update people set avatar_key = p_key where user_id = p_user;
+  exception when unique_violation then
+    raise exception 'That photo has already been taken';
+  end;
+  update players set avatar_key = p_key where user_id = p_user;
+end $$;
+
+revoke execute on function gm_gallery(uuid), gm_set_photo(uuid, text) from public, anon;
+grant execute on function gm_gallery(uuid), gm_set_photo(uuid, text) to authenticated;
 
 revoke execute on function my_person(), photo_gallery(), set_my_photo(text), gm_reset_photo(uuid) from public, anon;
 grant execute on function my_person(), photo_gallery(), set_my_photo(text), gm_reset_photo(uuid) to authenticated;

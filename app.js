@@ -5,7 +5,7 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const app = document.getElementById('app');
 const S = { user: null, admin: false, game: null, me: null, players: [], roles: {}, events: [], results: {},
-            messages: [], mine: {}, picks: {}, overview: null, dash: null, secrets: null, gmchat: [], curtain: false, person: null, gallery: [], picking: false, tab: 'game', error: '', notice: '', authTab: 'signin', peek: false, offer: null };
+            messages: [], mine: {}, picks: {}, overview: null, dash: null, secrets: null, gmchat: [], curtain: false, person: null, gallery: [], picking: false, gmPick: null, tab: 'game', error: '', notice: '', authTab: 'signin', peek: false, offer: null };
 
 // Display names come from Google profiles, so every interpolated value goes through esc().
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -173,6 +173,19 @@ function chat() {
     <div class="row" style="margin-top:12px"><input id="chat" maxlength="500" placeholder="Message fellow traitors"><button data-act="send">Send</button></div>`;
 }
 
+// The GM choosing a photo for someone else. Same gallery, but each tile acts on the chosen person.
+function gmPickerView() {
+  const g = S.gmPick;
+  const tiles = g.gallery.map(t => `<button class="pick-photo ${t.mine ? 'mine' : ''}" data-act="gmphoto" data-key="${esc(t.key)}"
+    ${t.taken ? 'disabled' : ''} aria-label="Photo ${esc(t.key)}${t.taken ? ', already taken' : ''}"><img src="avatars/${esc(t.key)}.webp" alt=""></button>`).join('');
+  const has = g.gallery.some(t => t.mine);
+  return `<h2 style="margin-top:0">Photo for ${esc(g.name)}</h2>
+    <p class="muted">Pick one for them. Theirs is outlined, and greyed-out photos belong to someone else.</p>
+    <div class="gallery">${tiles}</div>
+    <div class="gm-actions"><button class="ghost" data-act="gmphotocancel">Back</button>
+    ${has ? '<button class="ghost" data-act="gmphotoremove">Remove their photo</button>' : ''}</div>`;
+}
+
 function dashboard() {
   const d = S.dash;
   if (!d || S.game.status !== 'active') return '';
@@ -237,7 +250,7 @@ function gmPanel() {
   const lobby = S.game.status === 'lobby';
   const people = o.people.map(p => `<div class="pick-row"><label class="pick"><input type="checkbox" data-act="toggle" data-user="${esc(p.user_id)}"
     ${p.in_game ? 'checked' : ''} ${lobby ? '' : 'disabled'}> ${avatar({ display_name: p.name, avatar_key: p.avatar_key }, 'sm')} ${esc(p.name)} <span class="muted">${esc(p.email)}</span></label>
-    ${p.avatar_key ? `<button class="ghost small" data-act="resetphoto" data-user="${esc(p.user_id)}">Reset photo</button>` : '<span class="muted">no photo yet</span>'}</div>`).join('');
+    <button class="ghost small" data-act="choosephoto" data-user="${esc(p.user_id)}" data-name="${esc(p.name)}">${p.avatar_key ? 'Change photo' : 'Choose photo'}</button></div>`).join('');
   return `<div class="card"><h3>Game master</h3>
     <p class="muted">To register, people open this address and enter the signup code.</p>
     <div class="share"><b>${esc(location.origin + location.pathname)}</b><br>Signup code: <b>${esc(o.signup_code ?? '(not set)')}</b></div>
@@ -265,6 +278,7 @@ function view() {
       <div class="seg">${tab('signin', 'Sign in')}${tab('register', 'Register')}</div>${form}
       <div class="foot"><img src="assets/dev-logo.svg" alt="DEV" width="124" height="56"></div></div>`;
   }
+  if (S.admin && S.gmPick) return gmPickerView();
   if (!S.admin && S.person && (!S.person.avatar_key || S.picking)) return pickerView();
   const g = S.game;
   if (!g) return S.admin ? `<p>No game yet.</p><button data-act="create">Create game</button>` : `<p>No game yet. Check back soon.</p>`;
@@ -367,7 +381,23 @@ const actions = {
   },
   keepphoto: () => { S.picking = false; render(); },
   changephoto: async () => { S.picking = true; await refresh(); },
-  resetphoto: el => confirm('Clear this person\'s photo? They will be asked to choose again.') && call('gm_reset_photo', { p_user: el.dataset.user }),
+  choosephoto: async el => {
+    const { data, error } = await sb.rpc('gm_gallery', { p_user: el.dataset.user });
+    if (error) { S.error = error.message; return render(); }
+    S.gmPick = { user_id: el.dataset.user, name: el.dataset.name, gallery: data ?? [] };
+    S.error = '';
+    render();
+  },
+  gmphoto: async el => {
+    await call('gm_set_photo', { p_user: S.gmPick.user_id, p_key: el.dataset.key });
+    if (!S.error) { S.gmPick = null; await refresh(); }
+  },
+  gmphotoremove: async () => {
+    if (!confirm(`Remove ${S.gmPick.name}'s photo? They will be asked to choose again.`)) return;
+    await call('gm_reset_photo', { p_user: S.gmPick.user_id });
+    if (!S.error) { S.gmPick = null; await refresh(); }
+  },
+  gmphotocancel: () => { S.gmPick = null; render(); },
   toggle: el => call('gm_set_player', { p_game: S.game.id, p_user: el.dataset.user, p_in: el.checked }),
   logout: () => sb.auth.signOut().then(refresh),
   create: () => call('create_game'),

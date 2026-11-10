@@ -27,7 +27,7 @@ An asynchronous Traitors-style social deduction game for the org, played over we
 | Traitors | `max(2, round(players / 4))` |
 | Public chat | Dropped from v1; Slack instead |
 | Traitors chat | In game, readable/writable by traitors only |
-| Avatars | Team headshots bundled as static assets (`avatars/team-NN.webp`). Each person chooses theirs from a gallery after registering; one photo per person, changeable later, resettable by the GM. Initial letter shown until chosen |
+| Avatars | Team headshots bundled as static assets (`avatars/team-NN.webp`). Each person chooses theirs from a gallery after registering; one photo per person, changeable later. The GM can also give anyone a photo or remove it. Initial letter shown until chosen |
 | Vote tie | Broken at random among tied players |
 | Role reveal | Banished and murdered players' roles are shown to everyone |
 | Dead players | Can't act or post |

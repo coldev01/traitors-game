@@ -39,10 +39,10 @@ drop function if exists traitor_picks(uuid);
 
 ## 3. Team photos
 
-The 17 team photos are in `avatars/team-01.webp` to `team-17.webp` (320px, about 11KB each). Nobody's photo is assigned in advance: after registering, each person is shown the gallery and picks theirs ("Which one is you?"). A photo can belong to only one person, taken ones are greyed out, and people can change theirs later with **Change photo** in the top bar. In the GM panel each person's thumbnail shows next to their name, with a **Reset photo** button if someone picked the wrong face.
+The 21 team photos are in `avatars/team-01.webp` to `team-21.webp` (320px, about 11KB each). Nobody's photo is assigned in advance: after registering, each person is shown the gallery and picks theirs ("Which one is you?"). A photo can belong to only one person, taken ones are greyed out, and people can change theirs later with **Change photo** in the top bar. In the GM panel each person's thumbnail shows next to their name, with a **Choose photo** / **Change photo** button: you can give anyone a photo yourself (same rule, one photo per person, so a photo someone else holds is greyed out), or remove theirs so they choose again.
 
 - **Add a photo:** put `team-18.webp` in `avatars/` and run `insert into photos (key) values ('team-18');`.
-- **Pre-assign photos instead:** the choice is stored in `people.avatar_key`, so a one-off `update people set avatar_key = 'team-07' where email = '...';` binds a photo without the person choosing.
+- **Pre-assign photos in bulk:** use **Choose photo** per person in the GM panel, or a one-off `update people set avatar_key = 'team-07' where email = '...';`.
 - Photos are only fetched for the people in a game plus the gallery, so the images add little to page load.
 - If the site is published publicly (GitHub Pages), these photos are public too. Check the team is happy with that first.
 

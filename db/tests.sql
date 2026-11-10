@@ -16,13 +16,20 @@ begin
   if p_a is distinct from p_b then raise exception 'FAIL: % (got %, expected %)', p_label, p_a, p_b; end if;
 end $$;
 
--- p_expect matches either the SQLSTATE or a substring of the message
+-- p_expect matches either the SQLSTATE or a substring of the message. The call must actually fail:
+-- succeeding is a test failure, not a pass.
 create function tests.throws(p_sql text, p_expect text, p_label text) returns void language plpgsql as $$
+declare v_raised boolean := false;
 begin
-  execute p_sql;
-exception when others then
-  if sqlstate = p_expect or sqlerrm like '%' || p_expect || '%' then return; end if;
-  raise exception 'FAIL: % (wrong error: % %)', p_label, sqlstate, sqlerrm;
+  begin
+    execute p_sql;
+  exception when others then
+    v_raised := true;
+    if not (sqlstate = p_expect or sqlerrm like '%' || p_expect || '%') then
+      raise exception 'FAIL: % (wrong error: % %)', p_label, sqlstate, sqlerrm;
+    end if;
+  end;
+  if not v_raised then raise exception 'FAIL: % (no error was raised)', p_label; end if;
 end $$;
 
 create function tests.lives(p_sql text, p_label text) returns void language plpgsql as $$
@@ -697,7 +704,7 @@ insert into admins values ('gm@org.test');
 select tests.add_people(3);
 
 select tests.act_as('p1');
-select tests.eq(jsonb_array_length(photo_gallery()), 17, 'the gallery lists all 17 photos');
+select tests.eq(jsonb_array_length(photo_gallery()), 21, 'the gallery lists all 21 photos');
 select tests.eq((select count(*) from jsonb_array_elements(photo_gallery()) x where (x ->> 'taken')::boolean), 0::bigint, 'nothing is taken yet');
 select tests.lives($$select set_my_photo('team-01')$$, 'a person chooses a photo');
 select tests.eq(my_person() ->> 'avatar_key', 'team-01', 'their choice is saved');
@@ -741,6 +748,29 @@ select tests.eq((select avatar_key from people where user_id = tests.uid('p1')),
 select tests.eq((select avatar_key from players where game_id = tests.g()), null::text, 'and neither does their player row');
 select tests.act_as('p2');
 select tests.lives($$select set_my_photo('team-09')$$, 'the reset photo is free again');
+select tests.reset();
+
+-- the GM can give any account a photo
+select tests.act_as('p2');
+select tests.throws(format($$select gm_set_photo(%L, 'team-12')$$, tests.uid('p3')), 'admin only', 'players cannot assign photos');
+select tests.throws(format($$select gm_gallery(%L)$$, tests.uid('p3')), 'admin only', 'players cannot read another person''s gallery');
+select tests.act_as('gm');
+select tests.lives(format($$select gm_set_photo(%L, 'team-12')$$, tests.uid('p3')), 'the GM gives someone a photo');
+select tests.reset();
+select tests.eq((select avatar_key from people where user_id = tests.uid('p3')), 'team-12', 'it is saved on the person');
+select tests.eq((select avatar_key from players where game_id = tests.g() and user_id = tests.uid('p3')), null::text, 'players not in a game are unaffected');
+select tests.act_as('gm');
+select gm_set_player(tests.g(), tests.uid('p3'), true);
+select tests.lives(format($$select gm_set_photo(%L, 'team-13')$$, tests.uid('p3')), 'the GM can change it');
+select tests.reset();
+select tests.eq((select avatar_key from players where game_id = tests.g() and user_id = tests.uid('p3')), 'team-13', 'and it updates their games');
+select tests.act_as('gm');
+-- p2 holds team-09 at this point, so giving it to p3 must be refused
+select tests.throws(format($$select gm_set_photo(%L, 'team-09')$$, tests.uid('p3')), 'already been taken', 'a photo someone else holds is refused');
+select tests.throws(format($$select gm_set_photo(%L, 'team-99')$$, tests.uid('p3')), 'does not exist', 'unknown photos are refused');
+select tests.throws($$select gm_set_photo('00000000-0000-0000-0000-00000000dead', 'team-05')$$, 'No such person', 'unknown people are refused');
+select tests.ok((select (x ->> 'taken')::boolean from jsonb_array_elements(gm_gallery(tests.uid('p3'))) x where x ->> 'key' = 'team-09'), 'the GM gallery shows photos others hold as taken');
+select tests.ok((select (x ->> 'mine')::boolean from jsonb_array_elements(gm_gallery(tests.uid('p3'))) x where x ->> 'key' = 'team-13'), 'and the person''s own as theirs');
 select tests.reset();
 rollback to savepoint s12;
 
