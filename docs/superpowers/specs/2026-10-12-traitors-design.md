@@ -12,7 +12,7 @@ An asynchronous Traitors-style social deduction game for the org, played over we
 
 **Before full release (not v1):** missions (group quiz with traitor sabotage, shield reward). The schema has a nullable `mission` slot so this plugs in without a rewrite.
 
-**Out of scope:** in-game public chat (Slack is used for public discussion), recruitment, photo/real-world tasks, realtime sockets, animated characters (later swap of the `Avatar` scene).
+**Out of scope:** in-game public chat (Slack is used for public discussion), photo/real-world tasks, realtime sockets, animated characters (later swap of the `Avatar` scene).
 
 ## Decisions
 
@@ -66,6 +66,7 @@ Banishment and murder are two interleaved tracks, not a single day/night sequenc
 - **Banishment:** most votes is banished. Ties are broken at random among the tied players. Abstaining is allowed. The banished player is marked dead and their role is revealed at `reveals_at`.
 - **Murder:** optional. Traitors who lock in a victim vote among themselves; majority wins, ties random. If no traitor locks in a victim, nobody dies.
 - **Murder timing:** the victim is chosen at close but only applied (marked dead, role revealed) at `reveals_at`, so the reveal always lands before that day's banishment. A victim who voted before being applied has that vote discarded.
+- **Recruitment:** once 2 or fewer traitors are alive, a traitor's murder pick can instead be a recruit pick (majority across traitors, ties random, same as a murder). At the close the chosen faithful gets a private offer, open until the reveal. Accept: they become a traitor at the reveal (role card, traitors chat and traitor view update). Refuse, or no answer: nothing happens and nobody dies that round. Recruit results are visible to traitors only; everyone else sees an ordinary "nobody was murdered" round.
 - **Win check** after each applied result: faithful win when all traitors are out; traitors win when they equal or outnumber the faithful.
 
 ## Screens (Godot)

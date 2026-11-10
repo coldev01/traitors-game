@@ -256,7 +256,7 @@ update players set alive = false where display_name = 'h';
 select tests.act_as('c');
 select tests.lives(format($$select cast_vote('00000000-0000-0000-0000-0000000000b1', %L)$$, tests.pid(tests.g(), 'd')), 'alive player votes');
 select tests.lives(format($$select cast_vote('00000000-0000-0000-0000-0000000000b1', %L)$$, tests.pid(tests.g(), 'e')), 'vote can be changed');
-select tests.eq((select target_id from my_action('00000000-0000-0000-0000-0000000000b1')), tests.pid(tests.g(), 'e'), 'my_action returns latest vote');
+select tests.eq((select target_id from my_pick('00000000-0000-0000-0000-0000000000b1')), tests.pid(tests.g(), 'e'), 'my_pick returns latest vote');
 select tests.throws(format($$select cast_vote('00000000-0000-0000-0000-0000000000b1', %L)$$, tests.pid(tests.g(), 'c')), 'invalid target', 'cannot vote for self');
 select tests.throws(format($$select cast_vote('00000000-0000-0000-0000-0000000000b1', %L)$$, tests.pid(tests.g(), 'h')), 'invalid target', 'cannot vote for dead player');
 select tests.throws(format($$select cast_vote('00000000-0000-0000-0000-0000000000b3', %L)$$, tests.pid(tests.g(), 'd')), 'event not open', 'cannot vote in closed event');
@@ -271,7 +271,7 @@ select tests.throws(format($$select pick_victim('00000000-0000-0000-0000-0000000
 select tests.act_as('a');
 select tests.lives(format($$select pick_victim('00000000-0000-0000-0000-0000000000b2', %L)$$, tests.pid(tests.g(), 'd')), 'traitor picks a faithful victim');
 select tests.throws(format($$select pick_victim('00000000-0000-0000-0000-0000000000b2', %L)$$, tests.pid(tests.g(), 'b')), 'invalid target', 'traitor cannot target a traitor');
-select tests.eq((select count(*) from traitor_picks('00000000-0000-0000-0000-0000000000b2')), 1::bigint, 'traitor sees traitor picks');
+select tests.eq((select count(*) from team_picks('00000000-0000-0000-0000-0000000000b2')), 1::bigint, 'traitor sees traitor picks');
 
 select tests.lives(format($$select post_message(%L, 'hello')$$, tests.g()), 'traitor posts');
 select tests.act_as('c');
@@ -361,6 +361,114 @@ select pg_temp.act('b6', 'a', 'g');
 select advance_games('2026-11-13 15:01+00');
 select tests.eq((select winner from games where id = tests.g()), 'traitors', 'traitors >= faithful -> traitors win');
 rollback to savepoint s4;
+
+-------------------------------------------------------------------- 6. recruitment
+savepoint s6;
+select set_config('t.g', tests.make_game(8)::text, false);
+select tests.set_traitors(tests.g(), '{a,b}');
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status) values
+  ('00000000-0000-0000-0000-0000000000d1', tests.g(), 'murder', now() - interval '1 hour', now() + interval '1 hour', now() + interval '5 hours', 'open');
+
+select tests.act_as('c');
+select tests.throws(format($$select pick_recruit('00000000-0000-0000-0000-0000000000d1', %L)$$, tests.pid(tests.g(), 'd')), 'not allowed', 'faithful cannot recruit');
+select tests.act_as('a');
+select tests.throws(format($$select pick_recruit('00000000-0000-0000-0000-0000000000d1', %L)$$, tests.pid(tests.g(), 'b')), 'invalid target', 'cannot recruit a traitor');
+select tests.lives(format($$select pick_recruit('00000000-0000-0000-0000-0000000000d1', %L)$$, tests.pid(tests.g(), 'c')), 'traitor picks a recruit');
+select tests.eq((select kind from my_pick('00000000-0000-0000-0000-0000000000d1')), 'recruit', 'pick is recorded as a recruit');
+select tests.act_as('b');
+select tests.lives(format($$select pick_recruit('00000000-0000-0000-0000-0000000000d1', %L)$$, tests.pid(tests.g(), 'c')), 'second traitor agrees');
+select tests.reset();
+
+-- window closes: offer exists for c only, nobody has died, no reveal yet
+select advance_games(now() + interval '2 hours');
+select tests.eq((select kind from event_results where event_id = '00000000-0000-0000-0000-0000000000d1'), 'recruit', 'closed as a recruit offer');
+select tests.eq((select count(*) from players where game_id = tests.g() and not alive), 0::bigint, 'recruit round kills nobody');
+select tests.act_as('c');
+select tests.ok(my_offer(tests.g()) is not null, 'target sees the offer');
+select tests.act_as('d');
+select tests.ok(my_offer(tests.g()) is null, 'others see no offer');
+select tests.throws($$select respond_recruit('00000000-0000-0000-0000-0000000000d1', true)$$, 'no offer', 'non-target cannot answer');
+select tests.act_as('c');
+select tests.lives($$select respond_recruit('00000000-0000-0000-0000-0000000000d1', true)$$, 'target accepts');
+select tests.throws($$select respond_recruit('00000000-0000-0000-0000-0000000000d1', false)$$, 'no offer', 'answer cannot be changed');
+select tests.reset();
+
+-- reveal: c is now a traitor, nobody died, and non-traitors cannot see the result
+select advance_games(now() + interval '6 hours');
+select tests.eq((select role from roles where player_id = tests.pid(tests.g(), 'c')), 'traitor', 'accepted recruit becomes a traitor');
+select tests.eq((select count(*) from players where game_id = tests.g() and not alive), 0::bigint, 'still nobody dead');
+select tests.act_as('d');
+select tests.eq((select count(*) from event_results), 0::bigint, 'faithful cannot see a recruit result');
+select tests.act_as('a');
+select tests.eq((select count(*) from event_results), 1::bigint, 'traitors can see it');
+select tests.act_as('c');
+select tests.eq((select count(*) from roles), 3::bigint, 'recruit now sees both fellow traitors and self');
+select tests.reset();
+rollback to savepoint s6;
+
+-------------------------------------------------------------------- 6b. refusal, silence, limit
+savepoint s6b;
+select set_config('t.g', tests.make_game(8)::text, false);
+select tests.set_traitors(tests.g(), '{a,b}');
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status) values
+  ('00000000-0000-0000-0000-0000000000d2', tests.g(), 'murder', now() - interval '1 hour', now() + interval '1 hour', now() + interval '5 hours', 'open');
+select tests.act_as('a');
+select pick_recruit('00000000-0000-0000-0000-0000000000d2', tests.pid(tests.g(), 'c'));
+select tests.reset();
+select advance_games(now() + interval '2 hours');
+select tests.act_as('c');
+select respond_recruit('00000000-0000-0000-0000-0000000000d2', false);
+select tests.reset();
+select advance_games(now() + interval '6 hours');
+select tests.eq((select role from roles where player_id = tests.pid(tests.g(), 'c')), 'faithful', 'refusal leaves them faithful');
+select tests.eq((select count(*) from players where game_id = tests.g() and not alive), 0::bigint, 'refusal kills nobody');
+rollback to savepoint s6b;
+
+savepoint s6c;
+select set_config('t.g', tests.make_game(8)::text, false);
+select tests.set_traitors(tests.g(), '{a,b}');
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status) values
+  ('00000000-0000-0000-0000-0000000000d3', tests.g(), 'murder', now() - interval '1 hour', now() + interval '1 hour', now() + interval '5 hours', 'open');
+select tests.act_as('a');
+select pick_recruit('00000000-0000-0000-0000-0000000000d3', tests.pid(tests.g(), 'c'));
+select tests.reset();
+select advance_games(now() + interval '2 hours');
+select advance_games(now() + interval '6 hours');
+select tests.eq((select role from roles where player_id = tests.pid(tests.g(), 'c')), 'faithful', 'no answer counts as a refusal');
+rollback to savepoint s6c;
+
+savepoint s6d;
+select set_config('t.g', tests.make_game(8)::text, false);
+select tests.set_traitors(tests.g(), '{a,b,c}');
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status) values
+  ('00000000-0000-0000-0000-0000000000d4', tests.g(), 'murder', now() - interval '1 hour', now() + interval '1 hour', now() + interval '5 hours', 'open');
+select tests.act_as('a');
+select tests.throws(format($$select pick_recruit('00000000-0000-0000-0000-0000000000d4', %L)$$, tests.pid(tests.g(), 'd')), 'recruitment not available', 'no recruiting with 3 traitors');
+select tests.reset();
+rollback to savepoint s6d;
+
+-------------------------------------------------------------------- 7. slack announcements
+savepoint s7;
+select set_config('t.g', tests.make_game(8)::text, false);
+select tests.act_as('a');
+select tests.throws($$select gm_set_slack('https://hooks.slack.com/services/T0/B0/X')$$, 'admin only', 'non-GM cannot set the webhook');
+select tests.throws($$select gm_slack_test()$$, 'admin only', 'non-GM cannot send a test');
+select tests.throws($$select slack_post('hi')$$, '42501', 'clients cannot call slack_post directly');
+select tests.act_as('gm');
+select tests.throws($$select gm_set_slack('https://evil.example.com/hook')$$, 'not a Slack webhook', 'rejects non-Slack URLs');
+select tests.throws($$select gm_slack_test()$$, 'No Slack webhook', 'test needs a webhook first');
+select tests.lives($$select gm_set_slack('https://hooks.slack.com/services/T0/B0/X')$$, 'accepts a Slack URL');
+select tests.eq((gm_overview(tests.g()) ->> 'slack_on')::boolean, true, 'overview reports Slack connected');
+select tests.reset();
+-- Slack being unreachable (here pg_net may not even exist) must not stop a round from resolving.
+insert into events (game_id, kind, opens_at, closes_at, reveals_at) values (tests.g(), 'banishment', now() - interval '3 hours', now() - interval '1 hour', now() - interval '1 hour');
+select advance_games(now());
+select tests.eq((select status from events where game_id = tests.g()), 'revealed', 'round resolves even if Slack fails');
+select tests.act_as('gm');
+select tests.lives($$select gm_set_slack('')$$, 'GM can disconnect');
+select tests.eq((gm_overview(tests.g()) ->> 'slack_on')::boolean, false, 'overview reports disconnected');
+select tests.reset();
+rollback to savepoint s7;
 
 -------------------------------------------------------------------- 5. security / GM
 savepoint s5;

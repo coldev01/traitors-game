@@ -76,6 +76,13 @@ create table if not exists people (
 );
 alter table people enable row level security;
 
+-- Recruitment: a murder window can end in a recruit offer instead of a kill. accepted stays null until
+-- the target answers; null at reveal counts as a refusal.
+alter table actions add column if not exists kind text not null default 'kill' check (kind in ('kill', 'recruit'));
+alter table event_results add column if not exists kind text not null default 'kill' check (kind in ('kill', 'recruit'));
+alter table event_results add column if not exists accepted boolean;
+alter table events add column if not exists reminded boolean not null default false;
+
 alter table app_config enable row level security;
 alter table admins enable row level security;
 alter table games enable row level security;
@@ -123,7 +130,9 @@ create policy roles_select on roles for select to authenticated using (
 
 drop policy if exists results_select on event_results;
 create policy results_select on event_results for select to authenticated using (
-  in_game(game_id) and exists (select 1 from events e where e.id = event_id and e.status = 'revealed')
+  in_game(game_id)
+  and exists (select 1 from events e where e.id = event_id and e.status = 'revealed')
+  and (kind = 'kill' or is_traitor(game_id))
 );
 
 drop policy if exists messages_select on messages;
@@ -219,8 +228,32 @@ begin
     where p.id = p_target and p.game_id = ev.game_id and p.alive and r.role = 'faithful') then
     raise exception 'invalid target';
   end if;
-  insert into actions (event_id, player_id, target_id) values (p_event, me, p_target)
-  on conflict (event_id, player_id) do update set target_id = excluded.target_id, created_at = now();
+  insert into actions (event_id, player_id, target_id, kind) values (p_event, me, p_target, 'kill')
+  on conflict (event_id, player_id) do update set target_id = excluded.target_id, kind = 'kill', created_at = now();
+end $$;
+
+create or replace function pick_recruit(p_event uuid, p_target uuid) returns void language plpgsql security definer set search_path = public as $$
+declare ev events; me uuid;
+begin
+  select * into ev from events where id = p_event;
+  if ev.id is null or ev.kind <> 'murder' or ev.status <> 'open' or now() >= ev.closes_at then
+    raise exception 'event not open';
+  end if;
+  me := my_player(ev.game_id);
+  if me is null or not is_traitor(ev.game_id) or not (select alive from players where id = me) then
+    raise exception 'not allowed';
+  end if;
+  if (select count(*) from players p join roles r on r.player_id = p.id
+      where p.game_id = ev.game_id and p.alive and r.role = 'traitor') > 2 then
+    raise exception 'recruitment not available';
+  end if;
+  if not exists (
+    select 1 from players p join roles r on r.player_id = p.id
+    where p.id = p_target and p.game_id = ev.game_id and p.alive and r.role = 'faithful') then
+    raise exception 'invalid target';
+  end if;
+  insert into actions (event_id, player_id, target_id, kind) values (p_event, me, p_target, 'recruit')
+  on conflict (event_id, player_id) do update set target_id = excluded.target_id, kind = 'recruit', created_at = now();
 end $$;
 
 create or replace function post_message(p_game uuid, p_body text) returns void language plpgsql security definer set search_path = public as $$
@@ -236,15 +269,34 @@ begin
   insert into messages (game_id, player_id, body) values (p_game, me, left(trim(p_body), 500));
 end $$;
 
-create or replace function my_action(p_event uuid) returns table (target_id uuid) language sql stable security definer set search_path = public as $$
-  select a.target_id from actions a join players p on p.id = a.player_id
+create or replace function my_pick(p_event uuid) returns table (kind text, target_id uuid) language sql stable security definer set search_path = public as $$
+  select a.kind, a.target_id from actions a join players p on p.id = a.player_id
   where a.event_id = p_event and p.user_id = auth.uid()
 $$;
 
-create or replace function traitor_picks(p_event uuid) returns table (player_id uuid, target_id uuid) language sql stable security definer set search_path = public as $$
-  select a.player_id, a.target_id from actions a join events e on e.id = a.event_id
+create or replace function team_picks(p_event uuid) returns table (player_id uuid, kind text, target_id uuid) language sql stable security definer set search_path = public as $$
+  select a.player_id, a.kind, a.target_id from actions a join events e on e.id = a.event_id
   where a.event_id = p_event and e.kind = 'murder' and is_traitor(e.game_id)
 $$;
+
+-- The recruit offer is private to its target and open from the window closing until the reveal.
+create or replace function my_offer(p_game uuid) returns uuid language sql stable security definer set search_path = public as $$
+  select r.event_id from event_results r
+  join events e on e.id = r.event_id
+  join players p on p.id = r.target_id
+  where r.game_id = p_game and r.kind = 'recruit' and r.accepted is null
+    and e.status = 'closed' and p.alive and p.user_id = auth.uid()
+  limit 1
+$$;
+
+create or replace function respond_recruit(p_event uuid, p_accept boolean) returns void language plpgsql security definer set search_path = public as $$
+begin
+  update event_results r set accepted = p_accept
+  from events e, players p
+  where r.event_id = p_event and e.id = r.event_id and p.id = r.target_id
+    and r.kind = 'recruit' and r.accepted is null and e.status = 'closed' and p.alive and p.user_id = auth.uid();
+  if not found then raise exception 'no offer'; end if;
+end $$;
 
 create or replace function check_win(p_game uuid) returns void language plpgsql security definer set search_path = public as $$
 declare t int; f int;
@@ -262,39 +314,101 @@ end $$;
 -- Dead voters and dead targets are filtered here, not at cast time, because a murder is only
 -- applied at its reveal: a vote cast before then must be discarded once the voter is dead.
 create or replace function close_event(p_event uuid) returns void language plpgsql security definer set search_path = public as $$
-declare ev events; v_target uuid;
+declare ev events; v_target uuid; v_kind text;
 begin
   select * into ev from events where id = p_event for update;
-  select a.target_id into v_target
+  select a.target_id, a.kind into v_target, v_kind
   from actions a
   join players voter on voter.id = a.player_id and voter.alive
   join players t on t.id = a.target_id and t.alive
   where a.event_id = p_event and a.target_id is not null
-  group by a.target_id
+  group by a.kind, a.target_id
   order by count(*) desc, random()
   limit 1;
-  insert into event_results (event_id, game_id, target_id) values (p_event, ev.game_id, v_target);
+  -- Traitors may have grown back past the limit since they picked (a recruit already landed), so re-check.
+  if v_kind = 'recruit' and (select count(*) from players p join roles r on r.player_id = p.id
+                             where p.game_id = ev.game_id and p.alive and r.role = 'traitor') > 2 then
+    v_target := null;
+  end if;
+  insert into event_results (event_id, game_id, target_id, kind)
+  values (p_event, ev.game_id, v_target, case when v_target is null then 'kill' else coalesce(v_kind, 'kill') end);
   update events set status = 'closed' where id = p_event;
 end $$;
 
+create extension if not exists pg_net;
+
+-- Posts to the Slack webhook the GM saved. Does nothing until one is set. Only hooks.slack.com URLs are
+-- ever called (the database makes the request, so an arbitrary URL would be a server-side request hole).
+create or replace function slack_post(p_text text) returns void language plpgsql security definer set search_path = public as $$
+declare v_url text := (select value from app_config where key = 'slack_webhook');
+begin
+  if v_url is null or v_url not like 'https://hooks.slack.com/%' then return; end if;
+  -- A failed or unreachable Slack must never stop a round from resolving.
+  begin
+    perform net.http_post(url := v_url,
+                          -- Names are player-chosen, so neutralise Slack markup like <!channel>.
+                          body := jsonb_build_object('text', replace(replace(replace(p_text, '&', '&amp;'), '<', '&lt;'), '>', '&gt;')),
+                          headers := '{"Content-Type": "application/json"}'::jsonb);
+  exception when others then null;
+  end;
+end $$;
+
 create or replace function reveal_event(p_event uuid) returns void language plpgsql security definer set search_path = public as $$
-declare ev events; v_target uuid;
+declare ev events; v_target uuid; v_kind text; v_accepted boolean; v_name text; v_role text; g games;
 begin
   select * into ev from events where id = p_event for update;
-  select target_id into v_target from event_results where event_id = p_event;
+  select target_id, kind, accepted into v_target, v_kind, v_accepted from event_results where event_id = p_event;
   if v_target is not null then
-    update players set alive = false where id = v_target;
+    if v_kind = 'kill' then
+      update players set alive = false where id = v_target;
+    elsif v_accepted is true then
+      -- A target banished between the offer and the reveal can't be recruited.
+      update roles set role = 'traitor' where player_id = v_target and exists (select 1 from players where id = v_target and alive);
+    end if;
   end if;
   update events set status = 'revealed' where id = p_event;
+
+  -- A recruit round is announced as a quiet one so the faithful can't tell it apart.
+  if v_target is not null and v_kind = 'kill' then
+    select p.display_name, r.role into v_name, v_role from players p join roles r on r.player_id = p.id where p.id = v_target;
+    perform slack_post(format('%s was %s. They were %s.', v_name,
+      case ev.kind when 'banishment' then 'banished' else 'murdered' end,
+      case v_role when 'traitor' then 'a traitor' else 'faithful' end));
+  else
+    perform slack_post(format('Nobody was %s.', case ev.kind when 'banishment' then 'banished' else 'murdered' end));
+  end if;
+
   perform check_win(ev.game_id);
+  select * into g from games where id = ev.game_id;
+  if g.status = 'finished' then
+    perform slack_post(case g.winner when 'faithful' then 'The game is over. The Faithful win!' else 'The game is over. The Traitors win!' end);
+  end if;
 end $$;
 
 create or replace function advance_games(p_now timestamptz default now()) returns void language plpgsql security definer set search_path = public as $$
-declare e events;
+declare e events; tz text;
 begin
-  update events set status = 'open'
-  where status = 'scheduled' and opens_at <= p_now
-    and game_id in (select id from games where status = 'active');
+  for e in select ev.* from events ev join games g on g.id = ev.game_id
+           where g.status = 'active' and ev.status = 'scheduled' and ev.opens_at <= p_now
+           order by ev.opens_at loop
+    update events set status = 'open' where id = e.id;
+    -- Murder windows are the traitors' business, so only banishment votes are announced.
+    if e.kind = 'banishment' then
+      select g.tz into tz from games g where g.id = e.game_id;
+      perform slack_post(format('The banishment vote is open. It closes %s. Not voting counts as abstaining.',
+                                to_char(e.closes_at at time zone tz, 'FMDay "at" HH24:MI')));
+    end if;
+  end loop;
+
+  for e in select ev.* from events ev join games g on g.id = ev.game_id
+           where g.status = 'active' and ev.status = 'open' and ev.kind = 'banishment' and not ev.reminded
+             and ev.closes_at - interval '3 hours' <= p_now and ev.closes_at > p_now
+           order by ev.closes_at loop
+    update events set reminded = true where id = e.id;
+    select g.tz into tz from games g where g.id = e.game_id;
+    perform slack_post(format('Reminder: the banishment vote closes %s. If you have not voted yet, now is the time.',
+                              to_char(e.closes_at at time zone tz, 'FMDay "at" HH24:MI')));
+  end loop;
 
   for e in select ev.* from events ev join games g on g.id = ev.game_id
            where g.status = 'active' and ev.status = 'open' and ev.closes_at <= p_now
@@ -347,7 +461,7 @@ revoke execute on function
 revoke execute on function
   am_admin(), default_schedule(), create_game(),
   start_game(uuid, timestamp, jsonb, int, int), cast_vote(uuid, uuid), pick_victim(uuid, uuid),
-  post_message(uuid, text), my_action(uuid), traitor_picks(uuid),
+  post_message(uuid, text), pick_recruit(uuid, uuid), my_pick(uuid), team_picks(uuid), my_offer(uuid), respond_recruit(uuid, boolean),
   gm_force_close(uuid), gm_extend_event(uuid, interval), gm_delete_game(uuid),
   is_admin(), my_player(uuid), in_game(uuid), is_traitor(uuid)
   from public, anon;
@@ -356,7 +470,7 @@ revoke execute on function
 grant execute on function
   am_admin(), default_schedule(), create_game(),
   start_game(uuid, timestamp, jsonb, int, int), cast_vote(uuid, uuid), pick_victim(uuid, uuid),
-  post_message(uuid, text), my_action(uuid), traitor_picks(uuid),
+  post_message(uuid, text), pick_recruit(uuid, uuid), my_pick(uuid), team_picks(uuid), my_offer(uuid), respond_recruit(uuid, boolean),
   gm_force_close(uuid), gm_extend_event(uuid, interval), gm_delete_game(uuid),
   is_admin(), my_player(uuid), in_game(uuid), is_traitor(uuid)
   to authenticated;
@@ -368,6 +482,7 @@ begin
   return jsonb_build_object(
     'players', (select count(*) from players where game_id = p_game),
     'signup_code', (select value from app_config where key = 'signup_code'),
+    'slack_on', exists (select 1 from app_config where key = 'slack_webhook'),
     'people', coalesce((select jsonb_agg(jsonb_build_object(
                 'user_id', p.user_id, 'name', p.display_name, 'email', p.email,
                 'in_game', exists (select 1 from players g where g.game_id = p_game and g.user_id = p.user_id))
@@ -391,11 +506,37 @@ begin
   end if;
 end $$;
 
+create or replace function gm_set_slack(p_url text) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  if coalesce(p_url, '') = '' then
+    delete from app_config where key = 'slack_webhook';
+  elsif p_url not like 'https://hooks.slack.com/%' then
+    raise exception 'That is not a Slack webhook URL';
+  else
+    insert into app_config (key, value) values ('slack_webhook', p_url)
+    on conflict (key) do update set value = excluded.value;
+  end if;
+end $$;
+
+create or replace function gm_slack_test() returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  if not exists (select 1 from app_config where key = 'slack_webhook') then raise exception 'No Slack webhook is set'; end if;
+  perform slack_post('Test message from Traitors. If you can read this, announcements are working.');
+end $$;
+
+revoke execute on function slack_post(text) from public, anon, authenticated;
+revoke execute on function gm_set_slack(text), gm_slack_test() from public, anon;
+grant execute on function gm_set_slack(text), gm_slack_test() to authenticated;
+
 revoke execute on function gm_overview(uuid), gm_set_player(uuid, uuid, boolean) from public, anon;
 grant execute on function gm_overview(uuid), gm_set_player(uuid, uuid, boolean) to authenticated;
 
 -- join_game is gone: the GM selects players, nobody self-joins.
 drop function if exists join_game(uuid);
+drop function if exists my_action(uuid);
+drop function if exists traitor_picks(uuid);
 
 -- Seed (edit, run once):
 -- insert into app_config values ('org_domain', 'yourorg.com'), ('signup_code', 'pick-a-long-random-code');

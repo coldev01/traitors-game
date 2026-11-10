@@ -17,6 +17,26 @@
 - Forgotten password: Supabase dashboard → Authentication → Users → the user → Send password recovery, or delete the user and have them register again.
 - Rotate the code any time: `update app_config set value = '<new code>' where key = 'signup_code';`
 
+## 2a. Slack announcements (optional)
+
+Public updates only: a banishment vote opening, a reminder 3 hours before it closes, who was banished or murdered (and their role), and the final result. A recruit round is announced as "Nobody was murdered", exactly as in the app. Nothing secret is ever posted.
+
+1. Go to https://api.slack.com/apps, **Create New App → From scratch**, pick your workspace.
+2. **Incoming Webhooks** → turn on → **Add New Webhook to Workspace** → choose the channel → copy the URL (it starts `https://hooks.slack.com/`).
+3. In the game's GM panel, paste it under **Slack announcements**, press **Save**, then **Send test**.
+4. If your workspace needs an owner to approve new apps, you'll be told when you add the webhook. A fallback that needs no app: Slack **Workflow Builder → From a webhook**, with a text variable named `text`, and a step that posts it to the channel. Use that trigger URL instead.
+
+Use a throwaway channel for the dry run, because Slack messages can't be unsent from here. Press **Disconnect** to stop posting at any time.
+
+## 2b. One-off cleanup after upgrading an existing project
+
+Recruitment replaced two read functions (`my_action`, `traitor_picks`) with `my_pick` and `team_picks`. After re-running `db/schema.sql`, remove the old ones in the SQL editor (the tool that applies migrations won't run `drop`):
+
+```sql
+drop function if exists my_action(uuid);
+drop function if exists traitor_picks(uuid);
+```
+
 ## 3. Headshots
 
 Put `avatars/<email-prefix>.jpg` (e.g. `ada.lovelace.jpg` for `ada.lovelace@org.com`). Missing photos fall back to the initial.
