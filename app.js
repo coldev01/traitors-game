@@ -5,7 +5,7 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const app = document.getElementById('app');
 const S = { user: null, admin: false, game: null, me: null, players: [], roles: {}, events: [], results: {},
-            messages: [], mine: {}, picks: {}, overview: null, dash: null, secrets: null, gmchat: [], curtain: false, person: null, gallery: [], picking: false, skipPhoto: false, gmPick: null, tab: 'game', error: '', notice: '', authTab: 'signin', peek: false, offer: null };
+            messages: [], mine: {}, picks: {}, overview: null, dash: null, secrets: null, gmchat: [], curtain: false, person: null, gallery: [], picking: false, skipPhoto: false, gmPick: null, lobbyStep: 'players', tab: 'game', error: '', notice: '', authTab: 'signin', peek: false, offer: null, recovery: false, voting: null, voteSel: null, voteKind: 'kill' };
 
 // Display names come from Google profiles, so every interpolated value goes through esc().
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -77,11 +77,15 @@ function pickerView() {
   const changing = S.person.avatar_key && S.picking;
   const tiles = S.gallery.map(g => `<button class="pick-photo ${g.mine ? 'mine' : ''}" data-act="photo" data-key="${esc(g.key)}"
     ${g.taken ? 'disabled' : ''} aria-label="Photo ${esc(g.key)}${g.taken ? ', already taken' : ''}"><img src="avatars/${esc(g.key)}.webp" alt=""></button>`).join('');
-  return `<h2 style="margin-top:0">${changing ? 'Change your photo' : 'Choose your photo'}</h2>
+  const fields = changing ? `<div class="edit-fields"><label>Name<input id="ename" maxlength="40" value="${esc(S.person.display_name)}" autocomplete="off"></label>
+      <label>New password<input id="epw" type="password" placeholder="Leave blank to keep yours" autocomplete="new-password"></label></div>
+    <div class="gm-actions"><button data-act="savemine">Save</button></div>` : '';
+  return `<h2 style="margin-top:0">${changing ? 'Edit your details' : 'Choose your photo'}</h2>
+    ${fields}${changing ? '<h3 style="margin-top:24px">Photo</h3>' : ''}
     <p class="muted">${changing ? 'Pick a new one. Yours is outlined.' : 'Which one is you? This is how everyone in the game will see you.'} Greyed-out photos have been taken.</p>
     <div class="gallery">${tiles}</div>
     ${!changing && !S.gallery.some(g => !g.taken) ? '<p class="warn">Every photo has been taken. Ask the game master to add yours. You can carry on with your initial for now.</p>' : ''}
-    ${changing ? '<div class="gm-actions"><button class="ghost" data-act="keepphoto">Keep my photo</button></div>'
+    ${changing ? '<div class="gm-actions"><button class="ghost" data-act="keepphoto">Back</button></div>'
       : !S.gallery.some(g => !g.taken) ? '<div class="gm-actions"><button data-act="skipphoto">Continue with my initial</button></div>' : ''}`;
 }
 
@@ -90,8 +94,8 @@ function playerGrid() {
   const murdered = new Set(S.events.filter(e => e.kind === 'murder' && e.status === 'revealed' && S.results[e.id]?.kind === 'kill').map(e => S.results[e.id].target));
   return `<div class="grid">${S.players.map(p => {
     const role = S.roles[p.id];
-    // Alive players' roles are only visible to us when they are a fellow traitor.
-    const tag = role && (!p.alive || p.id === S.me?.id || mineTraitor || S.game.status === 'finished')
+    // Our own role and fellow traitors only show while the sealed role card is open, so a glance at the grid gives nothing away.
+    const tag = role && (!p.alive || S.game.status === 'finished' || ((p.id === S.me?.id || mineTraitor) && (S.peek || !S.me?.alive)))
       ? `<span class="tag ${role}">${role}</span>` : '';
     return `<div class="player ${p.alive ? '' : 'dead'}"><span class="avwrap">${avatar(p)}${murdered.has(p.id) ? '<img class="slain" src="assets/murdered.svg" alt="Murdered">' : ''}</span><span class="pname">${esc(p.display_name)}</span><br>${tag}</div>`;
   }).join('')}</div>`;
@@ -116,29 +120,64 @@ function eventPanel(e) {
       <p class="muted choice">Your choice: ${c === true ? 'end the game' : c === false ? 'keep playing' : 'nothing yet'}. You can change it until everyone has answered.</p></div>`;
   }
   if (!murder) {
-    const targets = S.players.filter(p => p.alive && p.id !== me.id);
-    const chosen = mine?.target ? name(mine.target) : 'nothing yet';
+    const voted = mine?.target && S.players.find(p => p.id === mine.target);
     // A murder can land while a banishment is still open; votes for the victim are dropped at the close.
-    const stale = mine?.target && !S.players.find(p => p.id === mine.target)?.alive;
-    return `<div class="slip"><h3>Vote to banish</h3>${clock}<div class="row"><select id="sel-${esc(e.id)}">${options(targets, 'Choose a player to banish', true)}</select>
-      <button data-act="vote" data-ev="${esc(e.id)}">Cast vote</button></div>
-      ${stale ? `<p class="warn">Your vote was for ${esc(chosen)}, who is out of the game. It won't count. Choose again before the vote closes.</p>`
-              : `<p class="muted choice">Your vote: ${esc(chosen)}. ${e.untimed ? 'You can change it until everyone has voted.' : 'No vote counts as abstaining.'}</p>`}</div>`;
+    const stale = voted && !voted.alive;
+    const body = !voted ? `<p>You haven't voted yet.</p><div class="row"><button data-act="votescreen" data-ev="${esc(e.id)}">Cast your vote</button></div>`
+      : stale ? `<p class="warn">Your vote was for ${esc(voted.display_name)}, who is out of the game. It won't count. Choose again before the vote closes.</p>
+          <div class="row"><button data-act="votescreen" data-ev="${esc(e.id)}">Choose again</button></div>`
+      : `<div class="voted"><span class="muted">You voted for</span><span class="voteface">${avatar(voted)}<b class="bigname">${esc(voted.display_name)}</b></span></div>
+          <div class="row"><button class="ghost" data-act="votescreen" data-ev="${esc(e.id)}">Change vote</button></div>
+          <p class="muted choice">${e.untimed ? 'You can change it until everyone has voted.' : 'You can change it until the vote closes.'}</p>`;
+    return `<div class="slip"><h3>Banishment vote</h3>${clock}${body}</div>`;
   }
   if (S.roles[me.id] !== 'traitor') return '';
-  const targets = S.players.filter(p => p.alive && S.roles[p.id] !== 'traitor');
   const traitorsLeft = S.players.filter(p => p.alive && S.roles[p.id] === 'traitor').length;
   const canRecruit = traitorsLeft <= 2;
-  const opt = (kind, p) => `<option value="${kind}:${esc(p.id)}">${esc(p.display_name)}</option>`;
-  const select = `<select id="sel-${esc(e.id)}"><option value="">No murder</option>
-    <optgroup label="Murder">${targets.map(p => opt('kill', p)).join('')}</optgroup>
-    ${canRecruit ? `<optgroup label="Recruit">${targets.map(p => opt('recruit', p)).join('')}</optgroup>` : ''}</select>`;
-  const chosen = mine ? (mine.target ? `${mine.kind === 'recruit' ? 'recruit' : 'murder'} ${name(mine.target)}` : 'no murder') : 'nothing yet';
+  const picked = mine?.target && S.players.find(p => p.id === mine.target);
   const team = (S.picks[e.id] ?? []).map(k => `${esc(name(k.player_id))} → ${esc(k.target_id ? `${k.kind === 'recruit' ? 'recruit ' : ''}${name(k.target_id)}` : 'nobody')}`).join(', ');
+  const body = !mine ? '<p>You haven\'t chosen yet.</p>'
+    : picked ? `<div class="voted"><span class="muted">${mine.kind === 'recruit' ? 'You will recruit' : 'You will murder'}</span><span class="voteface">${avatar(picked)}<b class="bigname">${esc(picked.display_name)}</b></span></div>`
+    : '<div class="voted"><span class="muted">Your pick</span><b class="bigname">No murder</b></div>';
   return `<div class="slip murder"><h3>${canRecruit ? 'Murder or recruit' : 'Choose a victim'}</h3>${clock}
     ${canRecruit ? `<p class="muted">Only ${traitorsLeft} traitor${traitorsLeft === 1 ? '' : 's'} left. You can recruit a faithful instead of murdering. They can refuse, and then nothing happens.</p>` : ''}
-    <div class="row">${select}<button data-act="murder" data-ev="${esc(e.id)}">${canRecruit ? 'Confirm' : 'Choose victim'}</button></div>
-    <p class="muted choice">Your pick: ${esc(chosen)}${team ? `<br>Traitor picks: ${team}` : ''}</p></div>`;
+    ${body}<div class="row"><button ${mine ? 'class="ghost"' : ''} data-act="votescreen" data-ev="${esc(e.id)}">${mine ? 'Change pick' : 'Choose'}</button></div>
+    ${team ? `<p class="muted choice">Traitor picks: ${team}</p>` : ''}</div>`;
+}
+
+// Full-screen vote: clock and Cast vote stay at the top, the choice is a ring round a photo, and nothing is sent until Cast vote.
+function voteView(e) {
+  const me = S.me, sel = S.voteSel;
+  const targets = S.players.filter(p => p.alive && p.id !== me.id);
+  const picked = targets.find(p => p.id === sel);
+  const clock = e.untimed ? '<p class="clock"><small>No deadline: it closes when everyone has voted</small></p>'
+                          : `<p class="clock">${countdown(e.closes_at)}<small>left to decide</small></p>`;
+  const tiles = targets.map(p => `<label class="tile"><input type="radio" name="vote" value="${esc(p.id)}" ${p.id === sel ? 'checked' : ''}>
+    <span class="face">${avatar(p)}</span><span class="pname">${esc(p.display_name)}</span></label>`).join('');
+  return `<div class="votebar"><h2>Vote to banish</h2>${clock}
+    <div class="row"><button data-act="cast" data-ev="${esc(e.id)}" ${picked ? '' : 'disabled'}>${picked ? `Cast vote for ${esc(picked.display_name)}` : 'Cast vote'}</button>
+    <button class="ghost" data-act="voteback">Back</button></div>
+    <p class="muted choice">${picked ? `Selected: ${esc(picked.display_name)}` : 'Choose who to banish.'}</p></div>
+    <div class="tiles">${tiles}</div>`;
+}
+
+function murderView(e) {
+  const me = S.me, sel = S.voteSel, kind = S.voteKind;
+  const targets = S.players.filter(p => p.alive && S.roles[p.id] !== 'traitor');
+  const canRecruit = S.players.filter(p => p.alive && S.roles[p.id] === 'traitor').length <= 2;
+  const picked = targets.find(p => p.id === sel);
+  const verb = kind === 'recruit' ? 'Recruit' : 'Murder';
+  const clock = `<p class="clock">${countdown(e.closes_at)}<small>left to decide</small></p>`;
+  const tiles = targets.map(p => `<label class="tile"><input type="radio" name="vote" value="${esc(p.id)}" ${p.id === sel ? 'checked' : ''}>
+    <span class="face">${avatar(p)}</span><span class="pname">${esc(p.display_name)}</span></label>`).join('');
+  const mode = (k, label) => `<button class="ghost ${kind === k ? 'active' : ''}" data-act="votekind" data-kind="${k}">${label}</button>`;
+  return `<div class="votebar"><h2>${canRecruit ? 'Murder or recruit' : 'Choose a victim'}</h2>${clock}
+    ${canRecruit ? `<div class="seg" style="margin:0 0 12px">${mode('kill', 'Murder')}${mode('recruit', 'Recruit')}</div>` : ''}
+    <div class="row"><button data-act="cast" data-ev="${esc(e.id)}" ${picked || sel === 'none' ? '' : 'disabled'}>${picked ? `${canRecruit ? verb + ' ' : 'Murder '}${esc(picked.display_name)}` : sel === 'none' ? 'Confirm: no murder' : 'Confirm'}</button>
+    <button class="ghost ${sel === 'none' ? 'active' : ''}" data-act="nomurder">No murder</button>
+    <button class="ghost" data-act="voteback">Back</button></div>
+    ${kind === 'recruit' && canRecruit ? '<p class="muted choice">They can refuse, and then nothing happens.</p>' : ''}</div>
+    <div class="tiles">${tiles}</div>`;
 }
 
 function offerCard() {
@@ -192,28 +231,49 @@ function gmPickerView() {
   const tiles = g.gallery.map(t => `<button class="pick-photo ${t.mine ? 'mine' : ''}" data-act="gmphoto" data-key="${esc(t.key)}"
     ${t.taken ? 'disabled' : ''} aria-label="Photo ${esc(t.key)}${t.taken ? ', already taken' : ''}"><img src="avatars/${esc(t.key)}.webp" alt=""></button>`).join('');
   const has = g.gallery.some(t => t.mine);
-  return `<h2 style="margin-top:0">Photo for ${esc(g.name)}</h2>
+  return `<h2 style="margin-top:0">Edit ${esc(g.name)}</h2>
+    <div class="edit-fields"><label>Name<input id="ename" maxlength="40" value="${esc(g.name)}" autocomplete="off"></label>
+      <label>New password<input id="epw" type="text" placeholder="Leave blank to keep theirs" autocomplete="off"></label></div>
+    <div class="gm-actions"><button data-act="gmsave">Save</button></div>
+    <h3 style="margin-top:24px">Photo</h3>
     <p class="muted">Pick one for them. Theirs is outlined, and greyed-out photos belong to someone else.</p>
     <div class="gallery">${tiles}</div>
     <div class="gm-actions"><button class="ghost" data-act="gmphotocancel">Back</button>
     ${has ? '<button class="ghost" data-act="gmphotoremove">Remove their photo</button>' : ''}</div>`;
 }
 
-// The GM decides who the traitors are, from the people already ticked into the game. Nothing ticked means random.
-function traitorPicker() {
+// Lobby, step 1 and 2. Each person is a photo tile: the checkbox is hidden and the photo ring shows the choice.
+function personTile(p, act, on, photoLink) {
+  return `<label class="tile"><input type="checkbox" data-act="${act}" data-user="${esc(p.user_id)}" ${on ? 'checked' : ''}>
+    <span class="face">${avatar({ display_name: p.name, avatar_key: p.avatar_key })}</span>
+    <span class="pname">${esc(p.name)}</span><span class="muted email">${esc(p.email)}</span>
+    ${photoLink ? `<a href="#" data-act="choosephoto" data-user="${esc(p.user_id)}" data-name="${esc(p.name)}">Edit</a>` : ''}</label>`;
+}
+
+function playersStep() {
   const o = S.overview;
-  const players = (o?.people ?? []).filter(p => p.in_game);
-  if (!players.length) return '';
+  const people = o?.people ?? [];
+  const short = (o?.players ?? 0) < 6;
+  return `<h2 style="margin-top:0">Who is playing?</h2>
+    <p class="muted">Tick everyone who is in this game. ${o?.players ?? 0} selected${short ? ', and you need at least 6' : ''}.</p>
+    ${people.length ? `<div class="tiles">${people.map(p => personTile(p, 'toggle', p.in_game, true)).join('')}</div>` : '<p class="muted">Nobody has registered yet.</p>'}
+    <div class="gm-actions"><button data-act="lobbynext" ${short ? 'disabled' : ''}>Next: choose the traitors</button></div>
+    <div class="gm-panel">${gmPanel()}</div>`;
+}
+
+// The GM decides who the traitors are, from the people ticked into the game. Nothing ticked means random.
+function traitorsStep() {
+  const players = (S.overview?.people ?? []).filter(p => p.in_game);
   const n = players.length, chosen = players.filter(p => p.traitor).length;
   const tooMany = chosen > 0 && chosen >= n - chosen;
   const note = tooMany ? `${chosen} of ${n} is too many: there must be fewer traitors than faithful.`
     : chosen ? `${chosen} traitor${chosen === 1 ? '' : 's'} chosen, ${n - chosen} faithful.`
     : `Nobody chosen, so ${Math.min(3, Math.max(2, Math.round(n / 6)))} will be picked at random when you start.`;
-  const rows = players.map(p => `<label class="pick"><input type="checkbox" data-act="traitor" data-user="${esc(p.user_id)}" ${p.traitor ? 'checked' : ''}>
-    ${avatar({ display_name: p.name, avatar_key: p.avatar_key }, 'sm')} ${esc(p.name)}</label>`).join('');
-  return `<div class="card"><h3>Choose the traitors</h3>
+  return `<h2 style="margin-top:0">Choose the traitors</h2>
     <p class="muted">Tick who the traitors are. Players only learn their role when you press Start.</p>
-    ${rows}<p class="${tooMany ? 'warn' : 'muted'}">${note}</p></div>`;
+    <div class="tiles">${players.map(p => personTile(p, 'traitor', p.traitor, false)).join('')}</div>
+    <p class="${tooMany ? 'warn' : 'muted'}">${note}</p>
+    <div class="gm-actions"><button class="ghost" data-act="lobbyback">Back</button><button data-act="start" ${tooMany ? 'disabled' : ''}>Start game</button></div>`;
 }
 
 function dashboard() {
@@ -282,14 +342,13 @@ function gmPanel() {
   const o = S.overview;
   if (!o) return '';
   const lobby = S.game.status === 'lobby';
-  const people = o.people.map(p => `<div class="pick-row"><label class="pick"><input type="checkbox" data-act="toggle" data-user="${esc(p.user_id)}"
-    ${p.in_game ? 'checked' : ''} ${lobby ? '' : 'disabled'}> ${avatar({ display_name: p.name, avatar_key: p.avatar_key }, 'sm')} ${esc(p.name)} <span class="muted">${esc(p.email)}</span></label>
-    <button class="ghost small" data-act="choosephoto" data-user="${esc(p.user_id)}" data-name="${esc(p.name)}">${p.avatar_key ? 'Change photo' : 'Choose photo'}</button></div>`).join('');
+  const people = lobby ? '' : o.people.map(p => `<div class="pick-row"><label class="pick"><input type="checkbox" disabled ${p.in_game ? 'checked' : ''}>
+    ${avatar({ display_name: p.name, avatar_key: p.avatar_key }, 'sm')} ${esc(p.name)} <span class="muted">${esc(p.email)}</span></label>
+    <a href="#" data-act="choosephoto" data-user="${esc(p.user_id)}" data-name="${esc(p.name)}">Edit</a></div>`).join('');
   return `<div class="card"><h3>Game master</h3>
     <p class="muted">To register, people open this address and enter the signup code.</p>
     <div class="share"><b>${esc(location.origin + location.pathname)}</b><br>Signup code: <b>${esc(o.signup_code ?? '(not set)')}</b></div>
-    <p class="muted">${o.players} selected for this game${lobby ? '. Tick the people who are playing.' : '.'}</p>
-    ${people || '<p class="muted">Nobody has registered yet.</p>'}
+    ${lobby ? '' : `<p class="muted">${o.players} selected for this game.</p>${people || '<p class="muted">Nobody has registered yet.</p>'}`}
     <h3 style="margin-top:20px">Slack announcements</h3>
     <p class="muted">${o.slack_on ? 'Connected. Votes opening, reminders, results and the final outcome are posted.' : 'Not connected. Paste a Slack webhook URL to post public updates to a channel.'}</p>
     <div class="row"><input id="slackurl" placeholder="https://hooks.slack.com/..." autocomplete="off">
@@ -303,7 +362,8 @@ function view() {
     const tab = (id, label) => `<button class="ghost ${S.authTab === id ? 'active' : ''}" data-act="authtab" data-tab="${id}">${label}</button>`;
     const form = S.authTab === 'signin'
       ? `<div class="form"><input id="email" type="email" placeholder="Email" autocomplete="username">
-         <input id="pw" type="password" placeholder="Password" autocomplete="current-password"><button data-act="login">Sign in</button></div>`
+         <input id="pw" type="password" placeholder="Password" autocomplete="current-password"><button data-act="login">Sign in</button>
+         <a href="#" data-act="forgot">Forgot your password?</a></div>`
       : `<div class="form"><input id="rname" placeholder="Your name"><input id="remail" type="email" placeholder="Work email" autocomplete="username">
          <input id="rpw" type="password" placeholder="Choose a password (8+ characters)" autocomplete="new-password">
          <input id="rpw2" type="password" placeholder="Confirm password" autocomplete="new-password">
@@ -312,19 +372,24 @@ function view() {
       <div class="seg">${tab('signin', 'Sign in')}${tab('register', 'Register')}</div>${form}
       <div class="foot"><img src="assets/dev-logo.svg" alt="DEV" width="124" height="56"></div></div>`;
   }
+  if (S.recovery) return `<h2 style="margin-top:0">Choose a new password</h2><div class="form"><input id="np1" type="password" placeholder="New password (8+ characters)" autocomplete="new-password">
+    <input id="np2" type="password" placeholder="Confirm new password" autocomplete="new-password"><button data-act="newpw">Save password</button></div>`;
+  const ve = S.voting && S.me?.alive && S.events.find(x => x.id === S.voting && isOpen(x));
+  if (ve) return ve.kind === 'murder' ? murderView(ve) : voteView(ve);
+  S.voting = null;
   if (S.admin && S.gmPick) return gmPickerView();
   if (!S.admin && S.person && ((!S.person.avatar_key && !S.skipPhoto) || S.picking)) return pickerView();
   const g = S.game;
   if (!g) return S.admin ? `<p>No game yet.</p><button data-act="create">Create game</button>` : `<p>No game yet. Check back soon.</p>`;
   if (g.status === 'lobby') {
-    if (S.admin) return `<h2>Lobby</h2>${gmPanel()}${traitorPicker()}<button data-act="start">Start game</button>`;
+    if (S.admin) return S.lobbyStep === 'traitors' ? traitorsStep() : playersStep();
     return S.me ? `<h2>Lobby</h2><p class="muted">Waiting for the game master to start.</p>${playerGrid()}`
                 : `<p>You haven't been added to this game yet. Ask the game master.</p>`;
   }
   if (g.status === 'finished') {
     return `<div class="winner ${esc(g.winner)}"><h1>${g.winner === 'faithful' ? 'The Faithful win' : 'The Traitors win'}</h1></div>${playerGrid()}<h2>What happened</h2>${timeline()}${S.admin ? gmPanel() : ''}${S.admin ? '<button data-act="create">New game</button>' : ''}`;
   }
-  if (S.admin) return `<h2>Game in progress</h2>${dashboard()}${curtain()}${gmPanel()}`;
+  if (S.admin) return `<h2>Game in progress</h2><div class="gm-grid">${dashboard()}${curtain()}${gmPanel()}</div>`;
   if (!S.me) return `<p>A game is in progress and you're not in it.</p>`;
   const role = S.roles[S.me.id], isTraitor = role === 'traitor';
   const tabs = isTraitor ? `<div class="seg" style="margin:0 0 20px"><button class="ghost ${S.tab === 'game' ? 'active' : ''}" data-act="tab" data-tab="game">Game</button>
@@ -339,7 +404,7 @@ function render() {
   const keep = {};
   app.querySelectorAll('select,input').forEach(e => { keep[e.id] = e.value; });
   const focus = document.activeElement?.id;
-  const header = S.user ? `<div class="bar"><span class="who"><span class="muted">${esc(S.user.email)}</span>${S.person && (S.person.avatar_key || S.skipPhoto) && !S.picking ? `<button class="ghost" data-act="changephoto">${S.person.avatar_key ? 'Change photo' : 'Choose photo'}</button>` : ''}<button class="ghost" data-act="logout">Sign out</button></span></div>` : '';
+  const header = S.user ? `<div class="bar"><span class="who"><span class="muted">${esc(S.user.email)}</span>${S.person && !S.admin && (S.person.avatar_key || S.skipPhoto) && !S.picking ? `<a href="#" data-act="changephoto">Edit</a>` : ''}<button class="ghost" data-act="logout">Sign out</button></span></div>` : '';
   app.innerHTML = header + (S.error ? `<div class="error">${esc(S.error)}</div>` : '')
     + (S.notice ? `<div class="notice">${esc(S.notice)}</div>` : '') + view()
     + (S.user ? `<footer class="site-foot"><img src="assets/dev-x-traitors.svg" alt="DEV x Traitors" width="233" height="60"></footer>` : '');
@@ -357,7 +422,6 @@ function tick() {
   });
 }
 
-const sel = id => document.getElementById('sel-' + id).value || null;
 const actions = {
   login: () => actions.loginWith(document.getElementById('email').value.trim(), document.getElementById('pw').value),
   loginWith: async (email, password) => {
@@ -370,6 +434,23 @@ const actions = {
     render();
     clearTimeout(S.peekTimer);
     S.peekTimer = setTimeout(() => { S.peek = false; render(); }, 6000);
+  },
+  forgot: async () => {
+    const email = document.getElementById('email').value.trim();
+    if (!email) { S.error = 'Enter your email above first.'; return render(); }
+    const { error } = await sb.auth.resetPasswordForEmail(email, { redirectTo: location.origin + location.pathname });
+    S.error = error?.message ?? '';
+    if (!error) S.notice = 'If that email is registered, a reset link is on its way.';
+    render();
+  },
+  newpw: async () => {
+    const a = document.getElementById('np1').value, b = document.getElementById('np2').value;
+    if (a.length < 8) { S.error = 'Password must be at least 8 characters'; return render(); }
+    if (a !== b) { S.error = 'The two passwords do not match'; return render(); }
+    const { error } = await sb.auth.updateUser({ password: a });
+    S.error = error?.message ?? '';
+    if (!error) { S.recovery = false; S.notice = 'Password changed.'; }
+    await refresh();
   },
   authtab: el => { S.authTab = el.dataset.tab; S.error = ''; render(); },
   register: async () => {
@@ -415,6 +496,20 @@ const actions = {
     if (!S.error) { S.picking = false; await refresh(); }
   },
   skipphoto: () => { S.skipPhoto = true; render(); },
+  savemine: async () => {
+    const n = document.getElementById('ename').value.trim(), pw = document.getElementById('epw').value;
+    if (pw && pw.length < 8) { S.error = 'Password must be at least 8 characters'; return render(); }
+    if (n !== S.person.display_name) {
+      const { error } = await sb.rpc('set_name', { p_user: S.user.id, p_name: n });
+      if (error) { S.error = error.message; return render(); }
+    }
+    if (pw) {
+      const { error } = await sb.auth.updateUser({ password: pw });
+      if (error) { S.error = error.message; return render(); }
+    }
+    S.picking = false; S.error = ''; S.notice = 'Saved.';
+    await refresh();
+  },
   keepphoto: () => { S.picking = false; render(); },
   changephoto: async () => { S.picking = true; await refresh(); },
   choosephoto: async el => {
@@ -433,20 +528,44 @@ const actions = {
     await call('gm_reset_photo', { p_user: S.gmPick.user_id });
     if (!S.error) { S.gmPick = null; await refresh(); }
   },
+  gmsave: async () => {
+    const g = S.gmPick, n = document.getElementById('ename').value.trim(), pw = document.getElementById('epw').value;
+    if (n !== g.name) {
+      const { error } = await sb.rpc('set_name', { p_user: g.user_id, p_name: n });
+      if (error) { S.error = error.message; return render(); }
+      g.name = n;
+    }
+    if (pw) {
+      const { data, error } = await sb.functions.invoke('set-password', { body: { user_id: g.user_id, password: pw } });
+      if (error || data?.error) { S.error = data?.error ?? error.message; return render(); }
+    }
+    S.gmPick = null; S.notice = 'Saved.';
+    await refresh();
+  },
   gmphotocancel: () => { S.gmPick = null; render(); },
+  lobbynext: () => { S.lobbyStep = 'traitors'; render(); },
+  lobbyback: () => { S.lobbyStep = 'players'; render(); },
   traitor: el => call('gm_set_traitor', { p_game: S.game.id, p_user: el.dataset.user, p_on: el.checked }),
   toggle: el => call('gm_set_player', { p_game: S.game.id, p_user: el.dataset.user, p_in: el.checked }),
   logout: () => sb.auth.signOut().then(refresh),
-  create: () => call('create_game'),
+  create: () => { S.lobbyStep = 'players'; return call('create_game'); },
   start: () => call('start_game', { p_game: S.game.id }),
-  vote: el => {
-    const target = sel(el.dataset.ev);
-    if (!target) { S.error = 'Choose a player to banish.'; return render(); }
-    return call('cast_vote', { p_event: el.dataset.ev, p_target: target });
+  votescreen: el => {
+    const m = S.mine[el.dataset.ev], murder = S.events.find(x => x.id === el.dataset.ev)?.kind === 'murder';
+    S.voting = el.dataset.ev; S.error = '';
+    S.voteSel = m?.target ?? (murder && m ? 'none' : null);
+    S.voteKind = m?.kind === 'recruit' ? 'recruit' : 'kill';
+    render();
   },
-  murder: el => {
-    const [kind, id] = (document.getElementById('sel-' + el.dataset.ev).value || '').split(':');
-    return call(kind === 'recruit' ? 'pick_recruit' : 'pick_victim', { p_event: el.dataset.ev, p_target: id || null });
+  votekind: el => { S.voteKind = el.dataset.kind; render(); },
+  nomurder: () => { S.voteSel = 'none'; render(); },
+  voteback: () => { S.voting = null; render(); },
+  cast: async el => {
+    if (!S.voteSel) return;
+    const murder = S.events.find(x => x.id === el.dataset.ev)?.kind === 'murder';
+    const target = S.voteSel === 'none' ? null : S.voteSel;
+    await call(murder ? (S.voteKind === 'recruit' && target ? 'pick_recruit' : 'pick_victim') : 'cast_vote', { p_event: el.dataset.ev, p_target: target });
+    if (!S.error) { S.voting = null; render(); }
   },
   accept: async el => {
     await call('respond_recruit', { p_event: el.dataset.ev, p_accept: true });
@@ -475,6 +594,7 @@ let busy = false;
 document.addEventListener('click', async e => {
   const el = e.target.closest('[data-act]');
   if (!el || busy) return;
+  if (el.tagName === 'A') e.preventDefault();
   busy = true;
   el.disabled = true;
   S.notice = '';
@@ -490,11 +610,14 @@ document.addEventListener('click', async e => {
     el.disabled = false;
   }
 });
+document.addEventListener('change', e => {
+  if (e.target.name === 'vote') { S.voteSel = e.target.value; render(); }
+});
 document.addEventListener('keydown', e => {
   if (e.key === 'Enter') ({ chat: actions.send, pw: actions.login, gmchat: actions.gmsend })[e.target.id]?.();
 });
 
-sb.auth.onAuthStateChange(() => setTimeout(refresh, 0));
+sb.auth.onAuthStateChange(event => { if (event === 'PASSWORD_RECOVERY') S.recovery = true; setTimeout(refresh, 0); });
 
 // An open <select> is closed by a re-render, so don't poll over someone mid-choice.
 setInterval(() => { if (document.activeElement?.tagName !== 'SELECT') refresh(); }, 10000);

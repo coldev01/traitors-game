@@ -755,6 +755,18 @@ grant execute on function gm_gallery(uuid), gm_set_photo(uuid, text) to authenti
 revoke execute on function my_person(), photo_gallery(), set_my_photo(text), gm_reset_photo(uuid) from public, anon;
 grant execute on function my_person(), photo_gallery(), set_my_photo(text), gm_reset_photo(uuid) to authenticated;
 
+-- Names can be corrected by the person or the GM. players holds a copy for each game, so both tables change together.
+create or replace function set_name(p_user uuid, p_name text) returns void language plpgsql security definer set search_path = public as $$
+declare n text := btrim(p_name);
+begin
+  if p_user <> auth.uid() and not is_admin() then raise exception 'not allowed'; end if;
+  if n is null or length(n) not between 1 and 40 then raise exception 'Name must be 1 to 40 characters'; end if;
+  update people set display_name = n where user_id = p_user;
+  update players set display_name = n where user_id = p_user;
+end $$;
+revoke execute on function set_name(uuid, text) from public, anon;
+grant execute on function set_name(uuid, text) to authenticated;
+
 -- The GM isn't a player, so RLS hides players/events from them; this is their only window in.
 create or replace function gm_overview(p_game uuid) returns jsonb language plpgsql stable security definer set search_path = public as $$
 begin
