@@ -87,6 +87,19 @@ begin
 end $$;
 
 -- players a..n (letters), plus gm and an outsider; game already started with no events
+create function tests.uid(p_name text) returns uuid language sql stable security definer as $$
+  select id from auth.users where email = p_name || '@org.test'
+$$;
+
+create function tests.add_people(n int) returns void language plpgsql as $$
+declare u uuid; i int;
+begin
+  for i in 1..n loop
+    u := tests.make_user('p' || i);
+    insert into public.people (user_id, email, display_name, avatar_key) values (u, 'p' || i || '@org.test', 'p' || i, 'p' || i);
+  end loop;
+end $$;
+
 create function tests.make_game(n int) returns uuid language plpgsql as $$
 declare g uuid; u uuid; i int;
 begin
@@ -170,11 +183,12 @@ select tests.eq((select count(*) from messages), 1::bigint, 'traitor reads trait
 select tests.reset();
 rollback to savepoint s1;
 
--------------------------------------------------------------------- 2. join / start
+-------------------------------------------------------------------- 2. GM selects players / start
 savepoint s2;
-insert into app_config values ('org_domain', 'org.test');
 insert into admins values ('gm@org.test');
-select tests.make_user('gm'), tests.make_user('a'), tests.make_user('y@other.test');
+select tests.make_user('gm'), tests.make_user('a');
+-- people p1..p6 registered; 'a' is a plain registered account
+select tests.add_people(6);
 
 select tests.act_as('a');
 select tests.throws($$select create_game()$$, 'admin only', 'non-admin cannot create a game');
@@ -182,31 +196,26 @@ select tests.throws($$select create_game()$$, 'admin only', 'non-admin cannot cr
 select tests.act_as('gm');
 select set_config('t.g', create_game()::text, false);
 select tests.ok(tests.g() is not null, 'GM creates a game');
-select tests.throws(format($$select join_game(%L)$$, tests.g()), 'GM cannot play', 'GM cannot join');
+select tests.eq((gm_overview(tests.g()) -> 'people' -> 0 ->> 'in_game')::boolean, false, 'people start unselected');
 
 select tests.act_as('a');
-select tests.lives(format($$select join_game(%L)$$, tests.g()), 'org user joins');
-select tests.throws(format($$select join_game(%L)$$, tests.g()), '23505', 'duplicate join rejected');
-select tests.act_as('y@other.test');
-select tests.throws(format($$select join_game(%L)$$, tests.g()), 'org accounts only', 'non-org email rejected');
+select tests.throws(format($$select gm_set_player(%L, %L, true)$$, tests.g(), tests.uid('p1')), 'admin only', 'non-admin cannot select players');
 
-select tests.reset();
-delete from app_config;
-select tests.act_as('a');
-select tests.throws(format($$select join_game(%L)$$, tests.g()), 'org accounts only', 'no configured domain rejects everyone');
-select tests.reset();
-insert into app_config values ('org_domain', 'org.test');
-
--- 'a' is already in; add 4 more = 5 players, too few
-select tests.add_players(tests.g(), 4);
 select tests.act_as('gm');
+select tests.lives(format($$select gm_set_player(%L, %L, true)$$, tests.g(), tests.uid('p1')), 'GM selects a player');
+select tests.lives(format($$select gm_set_player(%L, %L, true)$$, tests.g(), tests.uid('p1')), 'selecting twice is harmless');
+select tests.eq((gm_overview(tests.g()) ->> 'players')::int, 1, 'one player selected');
+select tests.lives(format($$select gm_set_player(%L, %L, false)$$, tests.g(), tests.uid('p1')), 'GM deselects a player');
+select tests.eq((gm_overview(tests.g()) ->> 'players')::int, 0, 'player removed');
+
+-- 5 selected: too few
+select tests.lives(format($$select gm_set_player(%L, %L, true)$$, tests.g(), tests.uid('p' || i)), 'select p' || i) from generate_series(1, 5) i;
 select tests.throws(format($$select start_game(%L, '2026-10-19')$$, tests.g()), 'need at least 6 players', 'start needs 6 players');
 select tests.act_as('a');
 select tests.throws(format($$select start_game(%L, '2026-10-19')$$, tests.g()), 'admin only', 'non-admin cannot start');
 
-select tests.reset();
-insert into players (game_id, user_id, email, display_name) select tests.g(), tests.make_user('q'), 'q@org.test', 'q';
 select tests.act_as('gm');
+select gm_set_player(tests.g(), tests.uid('p6'), true);
 select start_game(tests.g(), '2026-10-19');
 select tests.reset();
 select tests.eq((select count(*) from roles where game_id = tests.g() and role = 'traitor'), 2::bigint, '6 players -> 2 traitors');
@@ -215,21 +224,22 @@ select tests.eq((select opens_at from events where game_id = tests.g() and kind 
                 '2026-10-19 09:00:00+01'::timestamptz, 'first banishment opens Mon 09:00 London');
 select tests.eq((select closes_at from events where game_id = tests.g() and kind = 'murder' order by opens_at limit 1),
                 '2026-10-22 00:00:00+01'::timestamptz, 'murder 1 closes Wed midnight (Thu 00:00)');
+select tests.act_as('gm');
+select tests.throws(format($$select gm_set_player(%L, %L, false)$$, tests.g(), tests.uid('p1')), 'game not in lobby', 'cannot change players once started');
+select tests.reset();
 rollback to savepoint s2;
 
--------------------------------------------------------------------- 2b. join limits
+-------------------------------------------------------------------- 2b. limits
 savepoint s2b;
-select set_config('t.g', tests.make_game(15)::text, false);
-select tests.make_user('late');
-select tests.act_as('late');
-select tests.throws(format($$select join_game(%L)$$, tests.g()), 'game not joinable', 'cannot join a started game');
-
+insert into admins values ('gm@org.test');
+select tests.make_user('gm');
+select tests.add_people(16);
+select tests.act_as('gm');
+select set_config('t.g', create_game()::text, false);
+select tests.lives(format($$select gm_set_player(%L, %L, true)$$, tests.g(), tests.uid('p' || i)), 'select p' || i) from generate_series(1, 15) i;
+select tests.throws(format($$select gm_set_player(%L, %L, true)$$, tests.g(), tests.uid('p16')), 'game full', '16th player rejected');
 select tests.reset();
-update games set status = 'lobby' where id = tests.g();
-select tests.act_as('late');
-select tests.throws(format($$select join_game(%L)$$, tests.g()), 'game full', '16th player rejected');
-
-select tests.reset();
+select internal_start_game(tests.g(), '2026-10-19'::timestamp, '[]'::jsonb, 1, 10080);
 select tests.eq((select count(*) from roles where game_id = tests.g() and role = 'traitor'), 4::bigint, '15 players -> 4 traitors');
 rollback to savepoint s2b;
 
@@ -368,7 +378,7 @@ select tests.throws(format($$select gm_delete_game(%L)$$, tests.g()), 'admin onl
 select tests.throws(format($$select gm_overview(%L)$$, tests.g()), 'admin only', 'non-GM cannot read overview');
 
 select tests.as_anon();
-select tests.throws(format($$select join_game(%L)$$, tests.g()), '42501', 'anon cannot call client functions');
+select tests.throws($$select create_game()$$, '42501', 'anon cannot call client functions');
 
 select tests.act_as('gm');
 select tests.eq((gm_overview(tests.g()) ->> 'players')::int, 8, 'GM overview counts players');

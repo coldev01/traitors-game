@@ -66,6 +66,16 @@ create table if not exists messages (
   created_at timestamptz not null default clock_timestamp()
 );
 
+-- Registered accounts, independent of any one game; the GM picks who plays each game.
+create table if not exists people (
+  user_id uuid primary key references auth.users on delete cascade,
+  email text not null unique,
+  display_name text not null,
+  avatar_key text,
+  created_at timestamptz not null default now()
+);
+alter table people enable row level security;
+
 alter table app_config enable row level security;
 alter table admins enable row level security;
 alter table games enable row level security;
@@ -137,27 +147,6 @@ begin
   if not is_admin() then raise exception 'admin only'; end if;
   insert into games default values returning id into v;
   return v;
-end $$;
-
-create or replace function join_game(p_game uuid) returns uuid language plpgsql security definer set search_path = public as $$
-declare
-  v_email text := lower(auth.jwt() ->> 'email');
-  v_domain text := (select value from app_config where key = 'org_domain');
-  g games;
-  v_id uuid;
-begin
-  if is_admin() then raise exception 'GM cannot play'; end if;
-  select * into g from games where id = p_game;
-  if g.id is null or g.status <> 'lobby' then raise exception 'game not joinable'; end if;
-  if v_domain is null or v_email is null or split_part(v_email, '@', 2) <> v_domain then
-    raise exception 'org accounts only';
-  end if;
-  if (select count(*) from players where game_id = p_game) >= 15 then raise exception 'game full'; end if;
-  insert into players (game_id, user_id, email, display_name, avatar_key)
-  values (p_game, auth.uid(), v_email,
-          coalesce(auth.jwt() -> 'user_metadata' ->> 'full_name', v_email), split_part(v_email, '@', 1))
-  returning id into v_id;
-  return v_id;
 end $$;
 
 create or replace function internal_start_game(
@@ -356,7 +345,7 @@ revoke execute on function
   from public, anon, authenticated;
 
 revoke execute on function
-  am_admin(), default_schedule(), create_game(), join_game(uuid),
+  am_admin(), default_schedule(), create_game(),
   start_game(uuid, timestamp, jsonb, int, int), cast_vote(uuid, uuid), pick_victim(uuid, uuid),
   post_message(uuid, text), my_action(uuid), traitor_picks(uuid),
   gm_force_close(uuid), gm_extend_event(uuid, interval), gm_delete_game(uuid),
@@ -365,7 +354,7 @@ revoke execute on function
 
 -- Explicit grant: don't rely on Supabase default privileges once PUBLIC is revoked.
 grant execute on function
-  am_admin(), default_schedule(), create_game(), join_game(uuid),
+  am_admin(), default_schedule(), create_game(),
   start_game(uuid, timestamp, jsonb, int, int), cast_vote(uuid, uuid), pick_victim(uuid, uuid),
   post_message(uuid, text), my_action(uuid), traitor_picks(uuid),
   gm_force_close(uuid), gm_extend_event(uuid, interval), gm_delete_game(uuid),
@@ -378,14 +367,36 @@ begin
   if not is_admin() then raise exception 'admin only'; end if;
   return jsonb_build_object(
     'players', (select count(*) from players where game_id = p_game),
-    'names', coalesce((select jsonb_agg(display_name order by display_name) from players where game_id = p_game), '[]'),
+    'signup_code', (select value from app_config where key = 'signup_code'),
+    'people', coalesce((select jsonb_agg(jsonb_build_object(
+                'user_id', p.user_id, 'name', p.display_name, 'email', p.email,
+                'in_game', exists (select 1 from players g where g.game_id = p_game and g.user_id = p.user_id))
+                order by p.display_name) from people p), '[]'),
     'events', coalesce((select jsonb_agg(to_jsonb(e) order by e.opens_at)
                         from (select * from events where game_id = p_game and status <> 'revealed'
                               order by opens_at limit 8) e), '[]'));
 end $$;
-revoke execute on function gm_overview(uuid) from public, anon;
-grant execute on function gm_overview(uuid) to authenticated;
+
+create or replace function gm_set_player(p_game uuid, p_user uuid, p_in boolean) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  if (select status from games where id = p_game) is distinct from 'lobby' then raise exception 'game not in lobby'; end if;
+  if p_in then
+    if (select count(*) from players where game_id = p_game) >= 15 then raise exception 'game full'; end if;
+    insert into players (game_id, user_id, email, display_name, avatar_key)
+    select p_game, user_id, email, display_name, avatar_key from people where user_id = p_user
+    on conflict (game_id, user_id) do nothing;
+  else
+    delete from players where game_id = p_game and user_id = p_user;
+  end if;
+end $$;
+
+revoke execute on function gm_overview(uuid), gm_set_player(uuid, uuid, boolean) from public, anon;
+grant execute on function gm_overview(uuid), gm_set_player(uuid, uuid, boolean) to authenticated;
+
+-- join_game is gone: the GM selects players, nobody self-joins.
+drop function if exists join_game(uuid);
 
 -- Seed (edit, run once):
--- insert into app_config values ('org_domain', 'yourorg.com');
+-- insert into app_config values ('org_domain', 'yourorg.com'), ('signup_code', 'pick-a-long-random-code');
 -- insert into admins values ('gm@yourorg.com');
