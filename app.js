@@ -41,7 +41,7 @@ async function loadGame() {
   S.events = ev.data ?? [];
   S.results = Object.fromEntries((re.data ?? []).map(r => [r.event_id, { target: r.target_id, kind: r.kind, accepted: r.accepted, votes: r.votes }]));
   S.me = S.players.find(p => p.user_id === S.user.id) ?? null;
-  S.mine = {}; S.picks = {}; S.messages = []; S.offer = null;
+  S.mine = {}; S.endChoice = {}; S.picks = {}; S.messages = []; S.offer = null;
   if (S.me && S.roles[S.me.id] === 'traitor') {
     const { data } = await sb.from('messages').select('*').eq('game_id', g).order('created_at').limit(200);
     S.messages = data ?? [];
@@ -50,6 +50,7 @@ async function loadGame() {
     if (!S.me) break;
     const { data } = await sb.rpc('my_pick', { p_event: e.id });
     if (data?.length) S.mine[e.id] = { kind: data[0].kind, target: data[0].target_id };
+    if (e.kind === 'endgame') S.endChoice[e.id] = (await sb.rpc('my_endgame', { p_event: e.id })).data;
     if (e.kind === 'murder' && S.roles[S.me.id] === 'traitor') S.picks[e.id] = (await sb.rpc('team_picks', { p_event: e.id })).data ?? [];
   }
   if (S.me?.alive) S.offer = (await sb.rpc('my_offer', { p_game: g })).data ?? null;
@@ -104,7 +105,16 @@ function eventPanel(e) {
   const me = S.me, murder = e.kind === 'murder';
   if (!me?.alive) return '';
   const mine = S.mine[e.id];
-  const clock = `<p class="clock">${countdown(e.closes_at)}<small>left to decide</small></p>`;
+  const clock = e.untimed ? '<p class="clock"><small>No deadline: it closes when everyone has answered</small></p>'
+                          : `<p class="clock">${countdown(e.closes_at)}<small>left to decide</small></p>`;
+  if (e.kind === 'endgame') {
+    const c = S.endChoice[e.id];
+    const pick = (end, label, cls) => `<button class="${cls}${c === end ? ' active' : ''}" data-act="endgame" data-ev="${esc(e.id)}" data-end="${end}">${label}</button>`;
+    return `<div class="slip"><h3>The end game</h3>${clock}
+      <p>If everyone chooses to end the game, it ends. If no traitor is left, the Faithful win. If any traitor is still here, the Traitors win. One vote to keep playing and it goes on.</p>
+      <div class="row">${pick(true, 'End the game', '')}${pick(false, 'Keep playing', 'ghost')}</div>
+      <p class="muted choice">Your choice: ${c === true ? 'end the game' : c === false ? 'keep playing' : 'nothing yet'}. You can change it until everyone has answered.</p></div>`;
+  }
   if (!murder) {
     const targets = S.players.filter(p => p.alive && p.id !== me.id);
     const chosen = mine?.target ? name(mine.target) : 'nothing yet';
@@ -113,7 +123,7 @@ function eventPanel(e) {
     return `<div class="slip"><h3>Vote to banish</h3>${clock}<div class="row"><select id="sel-${esc(e.id)}">${options(targets, 'Choose a player to banish', true)}</select>
       <button data-act="vote" data-ev="${esc(e.id)}">Cast vote</button></div>
       ${stale ? `<p class="warn">Your vote was for ${esc(chosen)}, who is out of the game. It won't count. Choose again before the vote closes.</p>`
-              : `<p class="muted choice">Your vote: ${esc(chosen)}. No vote counts as abstaining.</p>`}</div>`;
+              : `<p class="muted choice">Your vote: ${esc(chosen)}. ${e.untimed ? 'You can change it until everyone has voted.' : 'No vote counts as abstaining.'}</p>`}</div>`;
   }
   if (S.roles[me.id] !== 'traitor') return '';
   const targets = S.players.filter(p => p.alive && S.roles[p.id] !== 'traitor');
@@ -144,6 +154,7 @@ function timeline() {
   const done = S.events.filter(e => e.status === 'revealed').reverse().slice(0, 6);
   const items = done.map(e => {
     const r = S.results[e.id], verb = e.kind === 'banishment' ? 'banished' : 'murdered';
+    if (e.kind === 'endgame') return `<li class="banishment">${r?.accepted ? 'Everyone chose to end the game.' : 'Not everyone chose to end the game, so it goes on.'}</li>`;
     // Only traitors can read a recruit result; everyone else sees an ordinary quiet round.
     if (r?.kind === 'recruit') {
       return `<li class="${esc(e.kind)}"><b>${esc(name(r.target))}</b> ${r.accepted ? 'accepted and joined the traitors.' : 'refused. Nobody was murdered.'}</li>`;
@@ -151,7 +162,7 @@ function timeline() {
     const t = r?.target;
     // The saved text is the same breakdown Slack gets: a "Votes:" line, then one line per target, then notes.
     const votes = r?.votes ? `<div class="votes"><b>Votes</b><br>${r.votes.split('\n').slice(1).map(esc).join('<br>')}</div>` : '';
-    return `<li class="${esc(e.kind)}">${t ? `<b>${esc(name(t))}</b> was ${verb}. They were ${esc(S.roles[t] ?? '?')}.` : `Nobody was ${verb}.`}${votes}</li>`;
+    return `<li class="${esc(e.kind)}">${t ? `<b>${esc(name(t))}</b> was ${verb}.${S.roles[t] ? ` They were ${esc(S.roles[t])}.` : ''}` : `Nobody was ${verb}.`}${votes}</li>`;
   }).join('');
   return items ? `<ol class="timeline">${items}</ol>` : '<p class="muted">Nothing has happened yet.</p>';
 }
@@ -208,12 +219,12 @@ function traitorPicker() {
 function dashboard() {
   const d = S.dash;
   if (!d || S.game.status !== 'active') return '';
-  const label = e => e.kind === 'banishment' ? 'Banishment vote' : 'Murder window';
+  const label = e => e.kind === 'endgame' ? 'End game vote' : e.kind === 'banishment' ? 'Banishment vote' : 'Murder window';
   const controls = e => `<div class="row"><button class="ghost" data-act="close" data-ev="${esc(e.id)}">Close now</button>
-    <button class="ghost" data-act="extend" data-ev="${esc(e.id)}" data-by="6 hours">Add 6 hours</button>
-    <button class="ghost" data-act="extend" data-ev="${esc(e.id)}" data-by="1 day">Add a day</button>
+    ${e.untimed ? '' : `<button class="ghost" data-act="extend" data-ev="${esc(e.id)}" data-by="6 hours">Add 6 hours</button>
+    <button class="ghost" data-act="extend" data-ev="${esc(e.id)}" data-by="1 day">Add a day</button>`}
     ${e.kind === 'banishment' ? `<button class="ghost" data-act="remind" data-ev="${esc(e.id)}">Nudge on Slack</button>` : ''}
-    <button class="ghost" data-act="skip" data-ev="${esc(e.id)}">Skip, no result</button></div>`;
+    ${e.kind === 'endgame' ? '' : `<button class="ghost" data-act="skip" data-ev="${esc(e.id)}">Skip, no result</button>`}</div>`;
   let nextShown = false;
   const items = d.events.map(e => {
     if (e.status === 'scheduled') {
@@ -225,19 +236,23 @@ function dashboard() {
       return `<div class="dash-item"><b>${label(e)} closed</b><p class="muted">Result announced in ${countdown(e.reveals_at)}</p></div>`;
     }
     // Participation only: for murders the GM sees how many traitors have chosen, never who or what.
-    const done = e.kind === 'banishment' ? e.voted : e.picked, total = e.kind === 'banishment' ? e.voters : e.traitors;
+    const vote = e.kind !== 'murder';
+    const done = vote ? e.voted : e.picked, total = vote ? e.voters : e.traitors;
     const pct = total ? Math.round(100 * done / total) : 0;
-    const who = e.kind === 'banishment'
+    const who = vote
       ? (e.not_voted.length ? `<p class="muted">Still to vote: ${e.not_voted.map(esc).join(', ')}</p>` : '<p class="muted">Everyone has voted.</p>')
       : '';
     return `<div class="dash-item"><b>${label(e)}</b>
-      <p class="muted">${done} of ${total} ${e.kind === 'banishment' ? 'have voted' : 'traitors have chosen'}. Closes in ${countdown(e.closes_at)}</p>
+      <p class="muted">${done} of ${total} ${vote ? 'have voted' : 'traitors have chosen'}. ${e.untimed ? 'No deadline: it closes when everyone has answered.' : `Closes in ${countdown(e.closes_at)}`}</p>
       <div class="meter"><i style="width:${pct}%"></i></div>${who}${controls(e)}</div>`;
   }).join('');
   const turnout = d.history.length ? `<p class="muted">Recent votes, newest first: ${d.history.map(h => `${h.voted} voted`).join(', ')}</p>` : '';
   return `<div class="card"><h3>Right now</h3>
     <div class="stats"><div><b>${d.alive}</b><span>alive</span></div><div><b>${d.out}</b><span>out</span></div></div>
     ${items || '<p class="muted">Nothing is scheduled.</p>'}${turnout}
+    ${d.phase === 'normal' ? `<div class="dash-item"><b>Start the end game early</b><p class="muted">Voids anything open, cancels everything scheduled and starts the final banishment. The end game vote follows it.</p>
+      <div class="row"><button class="ghost" data-act="startend">Start the end game now</button></div></div>`
+      : `<div class="dash-item"><b>${d.phase === 'final' ? 'Final banishment' : 'End game'}</b><p class="muted">No murders and no deadlines now. Each vote closes when everyone alive has answered.</p></div>`}
     <div class="dash-item"><b>Delay the whole game</b><p class="muted">Moves every event still to come, for a holiday or an outage.</p>
       <div class="row"><button class="ghost" data-act="shift" data-by="1 day">Delay a day</button>
       <button class="ghost" data-act="shift" data-by="2 days">Delay 2 days</button></div></div></div>`;
@@ -315,7 +330,8 @@ function view() {
   const tabs = isTraitor ? `<div class="seg" style="margin:0 0 20px"><button class="ghost ${S.tab === 'game' ? 'active' : ''}" data-act="tab" data-tab="game">Game</button>
     <button class="ghost ${S.tab === 'chat' ? 'active' : ''}" data-act="tab" data-tab="chat">Traitors chat</button></div>` : '';
   if (isTraitor && S.tab === 'chat') return `${tabs}<h2 style="margin-top:0">Traitors chat</h2>${chat()}`;
-  return `${tabs}${S.offer ? offerCard() : ''}${roleCard(role)}
+  const finalNote = S.game.phase !== 'normal' ? '<p class="muted">The final stages. There are no more murders and roles are no longer revealed. Each vote closes when everyone alive has answered.</p>' : '';
+  return `${tabs}${finalNote}${S.offer ? offerCard() : ''}${roleCard(role)}
     ${S.events.filter(isOpen).map(eventPanel).join('')}<h2>Players</h2>${playerGrid()}<h2>What happened</h2>${timeline()}`;
 }
 
@@ -440,6 +456,8 @@ const actions = {
     await call('respond_recruit', { p_event: el.dataset.ev, p_accept: false });
     if (!S.error) { S.notice = 'You refused. Nothing happens.'; render(); }
   },
+  endgame: el => call('cast_endgame', { p_event: el.dataset.ev, p_end: el.dataset.end === 'true' }),
+  startend: () => confirm('Start the end game now? Anything open is voided and the final banishment begins.') && call('gm_start_endgame', { p_game: S.game.id }),
   close: el => call('gm_force_close', { p_event: el.dataset.ev }),
   extend: el => call('gm_extend_event', { p_event: el.dataset.ev, p_by: el.dataset.by || '1 day' }),
   delete: () => confirm('Delete this game and all its data?') && call('gm_delete_game', { p_game: S.game.id }),

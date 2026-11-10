@@ -51,10 +51,10 @@ An asynchronous Traitors-style social deduction game for the org, played over we
 
 | Event | Opens | Closes | Result shown |
 |---|---|---|---|
-| Banishment 1 | Mon 09:00 | Tue 15:00 | Tue 15:00 |
-| Murder 1 | Tue 15:00 | Wed 24:00 | Thu 09:00 |
-| Banishment 2 | Wed 09:00 | Thu 15:00 | Thu 15:00 |
-| Murder 2 | Thu 15:00 | Mon 24:00 | Tue 09:00 |
+| Banishment 1 | Mon 09:00 | Tue 09:00 | Tue 09:00 |
+| Murder 1 | Tue 09:00 | Wed 09:00 | Wed 09:00 |
+| Banishment 2 | Wed 09:00 | Thu 09:00 | Thu 09:00 |
+| Murder 2 | Thu 09:00 | Mon 09:00 | Mon 09:00 |
 
 Repeats weekly: two rounds a week, so a 10-player game runs roughly 2–3 weeks. Times live in game config, not code, so the schedule can change (or compress to minutes for dry runs) without code changes.
 
@@ -68,6 +68,14 @@ Banishment and murder are two interleaved tracks, not a single day/night sequenc
 - **Murder timing:** the victim is chosen at close but only applied (marked dead, role revealed) at `reveals_at`, so the reveal always lands before that day's banishment. A victim who voted before being applied has that vote discarded.
 - **Recruitment:** once 2 or fewer traitors are alive, a traitor's murder pick can instead be a recruit pick (majority across traitors, ties random, same as a murder). At the close the chosen faithful gets a private offer, open until the reveal. Accept: they become a traitor at the reveal (role card, traitors chat and traitor view update). Refuse, or no answer: nothing happens and nobody dies that round. Recruit results are visible to traitors only; everyone else sees an ordinary "nobody was murdered" round.
 - **Win check** after each applied result: faithful win when all traitors are out; traitors win when they equal or outnumber the faithful.
+
+## End game
+- Banished players' roles are shown while 7 or more are alive; from 6 or fewer alive they stay hidden until the game ends. Murder victims are always faithful, so nothing is hidden there.
+- The first banishment to open with 6 or fewer alive is the final one (games.phase 'final'). Everything still scheduled is dropped: no more murders, no recruiting.
+- The final banishment and the end game vote have no clock. Each closes the moment everyone alive has answered; the GM can close one early (anyone who has not answered counts as keep playing).
+- After the final banishment, if the game is still on, everyone alive votes End the game or Keep playing (traitors too). All End: faithful win if no traitor is alive, otherwise the traitors win. Any Keep playing: one more banishment, then the vote again.
+- Parity (traitors >= faithful) or 2 players left still ends the game at once.
+- The GM can start the end game early: anything open is voided and the final banishment begins.
 
 ## Screens (Godot)
 
@@ -104,6 +112,6 @@ Banishment and murder are two interleaved tracks, not a single day/night sequenc
 
 ## Assumptions to confirm
 
-- Voting opens 09:00 Mon and Wed; reveals are at 09:00.
-- Murder 2's window (Thu 15:00 to Mon 24:00) deliberately spans the weekend.
+- Nothing opens, closes or posts on Fri to Sun (the team is off alternate Fridays). Every event starts at 09:00 Mon to Thu.
+- Murder 2's window (Thu 09:00 to Mon 09:00) deliberately spans the weekend.
 - The org supplies headshots and an `email → photo` mapping.

@@ -230,7 +230,8 @@ select tests.eq((select count(*) from events where game_id = tests.g()), 48::big
 select tests.eq((select opens_at from events where game_id = tests.g() and kind = 'banishment' order by opens_at limit 1),
                 '2026-10-19 09:00:00+01'::timestamptz, 'first banishment opens Mon 09:00 London');
 select tests.eq((select closes_at from events where game_id = tests.g() and kind = 'murder' order by opens_at limit 1),
-                '2026-10-22 00:00:00+01'::timestamptz, 'murder 1 closes Wed midnight (Thu 00:00)');
+                '2026-10-21 09:00:00+01'::timestamptz, 'murder 1 closes Wed 09:00');
+select tests.eq((select count(*) from events where game_id = tests.g() and extract(isodow from opens_at at time zone 'Europe/London') > 4), 0::bigint, 'nothing opens Fri-Sun');
 select tests.act_as('gm');
 select tests.throws(format($$select gm_set_player(%L, %L, false)$$, tests.g(), tests.uid('p1')), 'game not in lobby', 'cannot change players once started');
 select tests.reset();
@@ -349,7 +350,10 @@ update players set alive = true where game_id = tests.g();
 select pg_temp.mk('b4', 'banishment', '2026-11-06 09:00+00', '2026-11-07 15:00+00', '2026-11-07 15:00+00');
 select pg_temp.act('b4', 'd', 'f'); select pg_temp.act('b4', 'e', 'f'); select pg_temp.act('b4', 'h', 'g');
 update players set alive = false where display_name in ('d', 'e') and game_id = tests.g();
+-- Only 6 are alive, which would make this the final banishment; this test is about the normal path.
+update games set phase = 'final' where id = tests.g();
 select advance_games('2026-11-07 15:01+00');
+update games set phase = 'normal' where id = tests.g();
 select tests.eq(pg_temp.alive('g'), false, 'votes from dead players are discarded');
 
 -- both traitors out -> faithful win
@@ -366,6 +370,8 @@ update players set alive = true where game_id = tests.g();
 update players set alive = false where display_name in ('c', 'd', 'e', 'f') and game_id = tests.g();
 select pg_temp.mk('b6', 'banishment', '2026-11-12 09:00+00', '2026-11-13 15:00+00', '2026-11-13 15:00+00');
 select pg_temp.act('b6', 'a', 'g');
+-- Few alive would make this the final banishment; this test is about the normal path.
+update games set phase = 'final' where id = tests.g();
 select advance_games('2026-11-13 15:01+00');
 select tests.eq((select winner from games where id = tests.g()), 'traitors', 'traitors >= faithful -> traitors win');
 rollback to savepoint s4;
@@ -899,6 +905,139 @@ select tests.eq((gm_overview(tests.g()) ->> 'players')::int, 8, 'GM overview cou
 select tests.lives($$select gm_force_close('00000000-0000-0000-0000-0000000000c1')$$, 'GM can force close');
 select tests.reset();
 rollback to savepoint s5;
+
+-------------------------------------------------------------------- 14. final banishment and end game
+-- Roles are hidden once 6 or fewer are alive; the first banishment to open with 6 or fewer alive is the last one,
+-- it and the end game vote have no clock, and they close when everyone alive has answered.
+create function tests.vote_all(p_event uuid, p_names text[], p_target text) returns void language plpgsql as $$
+declare n text;
+begin
+  foreach n in array p_names loop
+    perform tests.act_as(n);
+    perform public.cast_vote(p_event, tests.pid(tests.g(), p_target));
+  end loop;
+  perform tests.reset();
+end $$;
+create function tests.endgame_all(p_event uuid, p_names text[], p_end boolean) returns void language plpgsql as $$
+declare n text;
+begin
+  foreach n in array p_names loop
+    perform tests.act_as(n);
+    perform public.cast_endgame(p_event, p_end);
+  end loop;
+  perform tests.reset();
+end $$;
+grant execute on function tests.vote_all(uuid, text[], text), tests.endgame_all(uuid, text[], boolean) to authenticated, anon;
+
+savepoint s14a;
+select set_config('t.g', tests.make_game(7)::text, false);
+select tests.set_traitors(tests.g(), array['a', 'b', 'g']);
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at) values
+  ('00000000-0000-0000-0000-0000000000d1', tests.g(), 'banishment', now() - interval '1 hour', now() + interval '1 day', now() + interval '1 day');
+select advance_games();
+select tests.eq((select phase from games where id = tests.g()), 'normal', '7 alive: still the normal game');
+select tests.eq((select untimed from events where id = '00000000-0000-0000-0000-0000000000d1'), false, '7 alive: normal clock');
+select tests.vote_all('00000000-0000-0000-0000-0000000000d1', array['b', 'c', 'd', 'e'], 'a');
+update events set closes_at = now(), reveals_at = now() where id = '00000000-0000-0000-0000-0000000000d1';
+select advance_games();
+select tests.eq((select alive from players where id = tests.pid(tests.g(), 'a')), false, 'a banished at 7 alive');
+select tests.act_as('c');
+select tests.eq((select count(*) from roles r join players p on p.id = r.player_id where p.display_name = 'a'), 1::bigint, 'role shown when 7 were alive');
+select tests.reset();
+
+-- 6 alive (b, g traitors; c, d, e, f faithful): the next banishment to open is the final one
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at) values
+  ('00000000-0000-0000-0000-0000000000d3', tests.g(), 'banishment', now() - interval '1 minute', now() + interval '1 day', now() + interval '1 day'),
+  ('00000000-0000-0000-0000-0000000000d4', tests.g(), 'murder', now() + interval '1 day', now() + interval '2 days', now() + interval '2 days');
+select advance_games();
+select tests.eq((select phase from games where id = tests.g()), 'final', 'first banishment at 6 alive is the final one');
+select tests.eq((select untimed from events where id = '00000000-0000-0000-0000-0000000000d3'), true, 'final banishment has no clock');
+select tests.eq((select count(*) from events where game_id = tests.g() and status = 'scheduled'), 0::bigint, 'no later murder is left scheduled');
+select tests.vote_all('00000000-0000-0000-0000-0000000000d3', array['b', 'd', 'e', 'f', 'g'], 'c');
+select tests.eq((select status from events where id = '00000000-0000-0000-0000-0000000000d3'), 'open', 'final banishment waits for the last voter');
+select tests.vote_all('00000000-0000-0000-0000-0000000000d3', array['c'], 'f');
+select tests.eq((select status from events where id = '00000000-0000-0000-0000-0000000000d3'), 'revealed', 'closes and reveals once everyone has voted');
+select tests.eq((select alive from players where id = tests.pid(tests.g(), 'c')), false, 'c banished in the final banishment');
+select tests.act_as('d');
+select tests.eq((select count(*) from roles r join players p on p.id = r.player_id where p.display_name = 'c'), 0::bigint, 'role hidden at 6 alive');
+select tests.reset();
+select tests.eq((select phase from games where id = tests.g()), 'endgame', 'game moves to the end game');
+select tests.eq((select count(*) from events where game_id = tests.g() and kind = 'endgame' and status = 'open' and untimed), 1::bigint, 'end game vote is open and untimed');
+select tests.eq((select status from games where id = tests.g()), 'active', 'game carries on');
+
+-- not unanimous: one more banishment, then the vote again
+select tests.endgame_all((select id from events where game_id = tests.g() and kind = 'endgame' order by opens_at limit 1), array['b', 'd', 'e', 'f'], true);
+select tests.eq((select status from games where id = tests.g()), 'active', 'waiting for the last end game answer');
+select tests.endgame_all((select id from events where game_id = tests.g() and kind = 'endgame' order by opens_at limit 1), array['g'], false);
+select tests.eq((select status from games where id = tests.g()), 'active', 'one "keep playing" does not end it');
+select tests.eq((select count(*) from events where game_id = tests.g() and kind = 'banishment' and status = 'open' and untimed), 1::bigint, 'another untimed banishment opens');
+select tests.eq((select phase from games where id = tests.g()), 'final', 'back to a banishment');
+-- 5 alive (b, g, d, e, f): g is banished, leaving b as the last traitor
+select tests.vote_all((select id from events where game_id = tests.g() and kind = 'banishment' and status = 'open'), array['b', 'd', 'e', 'f'], 'g');
+select tests.vote_all((select id from events where game_id = tests.g() and kind = 'banishment' and status = 'open'), array['g'], 'b');
+select tests.eq((select alive from players where id = tests.pid(tests.g(), 'g')), false, 'g banished');
+select tests.eq((select count(*) from events where game_id = tests.g() and kind = 'endgame' and status = 'open'), 1::bigint, 'a fresh end game vote opens');
+select tests.endgame_all((select id from events where game_id = tests.g() and kind = 'endgame' and status = 'open'), array['b', 'd', 'e', 'f'], true);
+select tests.eq((select status from games where id = tests.g()), 'finished', 'unanimous end game ends the game');
+select tests.eq((select winner from games where id = tests.g()), 'traitors', 'a traitor still alive: the traitors win');
+rollback to savepoint s14a;
+
+-- unanimous with no traitor left: the faithful win
+savepoint s14b;
+select set_config('t.g', tests.make_game(6)::text, false);
+select tests.set_traitors(tests.g(), array['a']);
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at) values
+  ('00000000-0000-0000-0000-0000000000d5', tests.g(), 'banishment', now() - interval '1 minute', now() + interval '1 day', now() + interval '1 day');
+select advance_games();
+select tests.eq((select phase from games where id = tests.g()), 'final', 'a 6-player game starts with its final banishment');
+select tests.vote_all('00000000-0000-0000-0000-0000000000d5', array['a', 'c', 'd', 'e', 'f'], 'b');
+select tests.vote_all('00000000-0000-0000-0000-0000000000d5', array['b'], 'a');
+select tests.eq((select phase from games where id = tests.g()), 'endgame', 'faithful b banished, a traitor remains: end game');
+select tests.endgame_all((select id from events where game_id = tests.g() and kind = 'endgame'), array['a', 'c', 'd', 'e', 'f'], true);
+select tests.eq((select winner from games where id = tests.g()), 'traitors', 'ending it with the traitor alive loses');
+rollback to savepoint s14b;
+
+-- the GM can force an end game vote through when someone is missing, and "no answer" counts as keep playing
+savepoint s14c;
+insert into admins values ('gm@org.test');
+select set_config('t.g', tests.make_game(6)::text, false);
+select tests.set_traitors(tests.g(), array['a']);
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at) values
+  ('00000000-0000-0000-0000-0000000000d6', tests.g(), 'banishment', now() - interval '1 minute', now() + interval '1 day', now() + interval '1 day');
+select advance_games();
+select tests.vote_all('00000000-0000-0000-0000-0000000000d6', array['a', 'c', 'd', 'e', 'f'], 'b');
+select tests.vote_all('00000000-0000-0000-0000-0000000000d6', array['b'], 'a');
+select tests.endgame_all((select id from events where game_id = tests.g() and kind = 'endgame'), array['a', 'c', 'd', 'e'], true);
+-- Looked up before switching role: the GM is not a player, so RLS would hide the event from them.
+select set_config('t.e', (select id::text from events where game_id = tests.g() and kind = 'endgame'), false);
+select tests.act_as('gm');
+select gm_force_close(current_setting('t.e')::uuid);
+select tests.reset();
+select tests.eq((select status from games where id = tests.g()), 'active', 'missing answers count as keep playing');
+select tests.eq((select count(*) from events where game_id = tests.g() and kind = 'banishment' and status = 'open'), 1::bigint, 'so another banishment opens');
+rollback to savepoint s14c;
+
+-- GM starts the end game early
+savepoint s14d;
+insert into admins values ('gm@org.test');
+select set_config('t.g', tests.make_game(9)::text, false);
+select tests.set_traitors(tests.g(), array['a', 'b']);
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status) values
+  ('00000000-0000-0000-0000-0000000000d7', tests.g(), 'banishment', now() - interval '1 hour', now() + interval '1 day', now() + interval '1 day', 'open'),
+  ('00000000-0000-0000-0000-0000000000d8', tests.g(), 'murder', now() + interval '1 day', now() + interval '2 days', now() + interval '2 days', 'scheduled');
+select tests.act_as('c');
+select tests.throws(format($$select gm_start_endgame(%L)$$, tests.g()), 'admin only', 'only the GM can start the end game');
+select tests.act_as('gm');
+select gm_start_endgame(tests.g());
+select tests.reset();
+select tests.eq((select phase from games where id = tests.g()), 'final', 'GM start puts the game into the final banishment');
+select tests.eq((select count(*) from players where game_id = tests.g() and alive), 9::bigint, 'the voided round banishes nobody');
+select tests.eq((select count(*) from events where game_id = tests.g() and status = 'open' and kind = 'banishment' and untimed), 1::bigint, 'one untimed banishment open');
+select tests.eq((select count(*) from events where game_id = tests.g() and status = 'scheduled'), 0::bigint, 'nothing left scheduled');
+select tests.act_as('gm');
+select tests.throws(format($$select gm_start_endgame(%L)$$, tests.g()), 'already', 'cannot start it twice');
+select tests.reset();
+rollback to savepoint s14d;
 
 rollback;
 select 'all tests passed' as result;

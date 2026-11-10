@@ -106,6 +106,17 @@ alter table event_results add column if not exists votes text;
 alter table messages alter column player_id drop not null;
 alter table messages add column if not exists from_gm boolean not null default false;
 
+-- End game. phase: 'normal', then 'final' (the last banishment, and any later one) and 'endgame' (the vote to stop).
+-- Final-phase events have no clock (untimed): they close when everyone alive has answered, so closes_at/reveals_at
+-- are parked far in the future. role_public is false for players banished with 6 or fewer alive, so their role
+-- stays secret until the game ends.
+alter table games add column if not exists phase text not null default 'normal' check (phase in ('normal', 'final', 'endgame'));
+alter table events add column if not exists untimed boolean not null default false;
+alter table players add column if not exists role_public boolean not null default true;
+alter table actions add column if not exists end_vote boolean;
+alter table events drop constraint if exists events_kind_check;
+alter table events add constraint events_kind_check check (kind in ('banishment', 'murder', 'endgame'));
+
 alter table app_config enable row level security;
 alter table admins enable row level security;
 alter table games enable row level security;
@@ -146,7 +157,7 @@ create policy roles_select on roles for select to authenticated using (
   in_game(game_id) and (
     player_id = my_player(game_id)
     or (is_traitor(game_id) and role = 'traitor')
-    or exists (select 1 from players p where p.id = roles.player_id and not p.alive)
+    or exists (select 1 from players p where p.id = roles.player_id and not p.alive and p.role_public)
     or exists (select 1 from games g where g.id = roles.game_id and g.status = 'finished')
   )
 );
@@ -166,11 +177,12 @@ create or replace function am_admin() returns boolean language sql stable as $$ 
 -- Offsets are minutes from Monday 00:00 local time. Murder 1 closes Wed 24:00 (= Thu 00:00);
 -- murder 2 spans the weekend and closes Mon 24:00 (= Tue 00:00 next week).
 create or replace function default_schedule() returns jsonb language sql immutable as $$
+  -- Everything opens/closes Mon-Thu 09:00, never Fri-Sun (the team is off alternate Fridays). Murder 2 spans the weekend.
   select jsonb_build_array(
-    jsonb_build_object('kind', 'banishment', 'open', 0 * 1440 + 9 * 60, 'close', 1 * 1440 + 15 * 60, 'reveal', 1 * 1440 + 15 * 60),
-    jsonb_build_object('kind', 'murder',     'open', 1 * 1440 + 15 * 60, 'close', 3 * 1440,           'reveal', 3 * 1440 + 9 * 60),
-    jsonb_build_object('kind', 'banishment', 'open', 2 * 1440 + 9 * 60,  'close', 3 * 1440 + 15 * 60, 'reveal', 3 * 1440 + 15 * 60),
-    jsonb_build_object('kind', 'murder',     'open', 3 * 1440 + 15 * 60, 'close', 8 * 1440,           'reveal', 8 * 1440 + 9 * 60))
+    jsonb_build_object('kind', 'banishment', 'open', 540,  'close', 1980, 'reveal', 1980),
+    jsonb_build_object('kind', 'murder',     'open', 1980, 'close', 3420, 'reveal', 3420),
+    jsonb_build_object('kind', 'banishment', 'open', 3420, 'close', 4860, 'reveal', 4860),
+    jsonb_build_object('kind', 'murder',     'open', 4860, 'close', 10620, 'reveal', 10620))
 $$;
 
 create or replace function create_game() returns uuid language plpgsql security definer set search_path = public as $$
@@ -230,6 +242,32 @@ begin
   perform internal_start_game(p_game, p_anchor, p_schedule, p_weeks, p_period);
 end $$;
 
+-- Untimed events close the moment everyone alive has answered. An answer is a chosen target (banishment) or an
+-- end/keep-playing choice (end game).
+create or replace function settle_untimed(p_event uuid) returns void language plpgsql security definer set search_path = public as $$
+declare ev events;
+begin
+  select * into ev from events where id = p_event;
+  if ev.id is null or not ev.untimed or ev.status <> 'open' then return; end if;
+  if not exists (select 1 from players p where p.game_id = ev.game_id and p.alive and not exists (
+        select 1 from actions a where a.event_id = p_event and a.player_id = p.id
+          and (a.target_id is not null or a.end_vote is not null))) then
+    update events set closes_at = now(), reveals_at = now() where id = p_event;
+    perform advance_games();
+  end if;
+end $$;
+
+-- The last banishment and any repeat: no clock, no murder, roles stay hidden. Anything still scheduled is dropped.
+create or replace function open_final_banishment(p_game uuid) returns void language plpgsql security definer set search_path = public as $$
+declare t timestamptz := clock_timestamp();
+begin
+  update games set phase = 'final' where id = p_game;
+  delete from events where game_id = p_game and status = 'scheduled';
+  insert into events (game_id, kind, opens_at, closes_at, reveals_at, status, untimed)
+  values (p_game, 'banishment', t, t + interval '10 years', t + interval '10 years', 'open', true);
+  perform slack_post('The final banishment vote is open. There is no deadline: it closes when everyone has voted. Roles are no longer revealed.');
+end $$;
+
 create or replace function cast_vote(p_event uuid, p_target uuid) returns void language plpgsql security definer set search_path = public as $$
 declare ev events; me uuid;
 begin
@@ -245,6 +283,20 @@ begin
   end if;
   insert into actions (event_id, player_id, target_id) values (p_event, me, p_target)
   on conflict (event_id, player_id) do update set target_id = excluded.target_id, created_at = now();
+  perform settle_untimed(p_event);
+end $$;
+
+create or replace function cast_endgame(p_event uuid, p_end boolean) returns void language plpgsql security definer set search_path = public as $$
+declare ev events; me uuid;
+begin
+  select * into ev from events where id = p_event;
+  if ev.id is null or ev.kind <> 'endgame' or ev.status <> 'open' then raise exception 'event not open'; end if;
+  me := my_player(ev.game_id);
+  if me is null or not (select alive from players where id = me) then raise exception 'not allowed'; end if;
+  if p_end is null then raise exception 'choose end or keep playing'; end if;
+  insert into actions (event_id, player_id, end_vote) values (p_event, me, p_end)
+  on conflict (event_id, player_id) do update set end_vote = excluded.end_vote, created_at = now();
+  perform settle_untimed(p_event);
 end $$;
 
 create or replace function pick_victim(p_event uuid, p_target uuid) returns void language plpgsql security definer set search_path = public as $$
@@ -352,6 +404,15 @@ create or replace function close_event(p_event uuid) returns void language plpgs
 declare ev events; v_target uuid; v_kind text;
 begin
   select * into ev from events where id = p_event for update;
+  if ev.kind = 'endgame' then
+    -- accepted means "everyone alive chose to end it"; no answer counts as keep playing.
+    insert into event_results (event_id, game_id, target_id, kind, accepted)
+    values (p_event, ev.game_id, null, 'kill', not exists (
+      select 1 from players p where p.game_id = ev.game_id and p.alive
+        and not exists (select 1 from actions a where a.event_id = p_event and a.player_id = p.id and a.end_vote is true)));
+    update events set status = 'closed' where id = p_event;
+    return;
+  end if;
   select a.target_id, a.kind into v_target, v_kind
   from actions a
   join players voter on voter.id = a.player_id and voter.alive
@@ -425,13 +486,36 @@ end $$;
 
 create or replace function reveal_event(p_event uuid) returns void language plpgsql security definer set search_path = public as $$
 declare ev events; v_target uuid; v_kind text; v_accepted boolean; v_name text; v_role text; g games; v_votes text;
+        v_alive int; v_show_role boolean;
 begin
   select * into ev from events where id = p_event for update;
+
+  if ev.kind = 'endgame' then
+    select accepted into v_accepted from event_results where event_id = p_event;
+    update events set status = 'revealed' where id = p_event;
+    if v_accepted then
+      update games set status = 'finished', phase = 'endgame',
+        winner = case when exists (select 1 from players p join roles r on r.player_id = p.id
+                                   where p.game_id = ev.game_id and p.alive and r.role = 'traitor') then 'traitors' else 'faithful' end
+      where id = ev.game_id;
+      select * into g from games where id = ev.game_id;
+      perform slack_post('Everyone chose to end the game.');
+      perform slack_post(case g.winner when 'faithful' then 'The game is over. The Faithful win!' else 'The game is over. The Traitors win!' end);
+    else
+      perform slack_post('Not everyone chose to end the game, so it goes on.');
+      perform open_final_banishment(ev.game_id);
+    end if;
+    return;
+  end if;
+
   if ev.kind = 'banishment' then v_votes := vote_breakdown(p_event); end if;
   select target_id, kind, accepted into v_target, v_kind, v_accepted from event_results where event_id = p_event;
+  select count(*) into v_alive from players where game_id = ev.game_id and alive;
+  -- Murder victims are always faithful, so only banishments can hide anything: from 6 alive down, no role is shown.
+  v_show_role := ev.kind = 'murder' or v_alive >= 7;
   if v_target is not null then
     if v_kind = 'kill' then
-      update players set alive = false where id = v_target;
+      update players set alive = false, role_public = v_show_role where id = v_target;
     elsif v_accepted is true then
       -- A target banished between the offer and the reveal can't be recruited.
       update roles set role = 'traitor' where player_id = v_target and exists (select 1 from players where id = v_target and alive);
@@ -443,9 +527,8 @@ begin
   -- A recruit round is announced as a quiet one so the faithful can't tell it apart.
   if v_target is not null and v_kind = 'kill' then
     select p.display_name, r.role into v_name, v_role from players p join roles r on r.player_id = p.id where p.id = v_target;
-    perform slack_post(format('%s was %s. They were %s.', v_name,
-      case ev.kind when 'banishment' then 'banished' else 'murdered' end,
-      case v_role when 'traitor' then 'a traitor' else 'faithful' end)
+    perform slack_post(format('%s was %s.', v_name, case ev.kind when 'banishment' then 'banished' else 'murdered' end)
+      || case when v_show_role then format(' They were %s.', case v_role when 'traitor' then 'a traitor' else 'faithful' end) else '' end
       || coalesce(E'\n' || v_votes, ''));
   else
     perform slack_post(format('Nobody was %s.', case ev.kind when 'banishment' then 'banished' else 'murdered' end)
@@ -456,47 +539,81 @@ begin
   select * into g from games where id = ev.game_id;
   if g.status = 'finished' then
     perform slack_post(case g.winner when 'faithful' then 'The game is over. The Faithful win!' else 'The game is over. The Traitors win!' end);
+  elsif ev.untimed then
+    -- The last banishment is done and the game is still on: the end game vote follows, with no murder in between.
+    declare t timestamptz := clock_timestamp();
+    begin
+      update games set phase = 'endgame' where id = ev.game_id;
+      insert into events (game_id, kind, opens_at, closes_at, reveals_at, status, untimed)
+      values (ev.game_id, 'endgame', t, t + interval '10 years', t + interval '10 years', 'open', true);
+      perform slack_post('The end game vote is open. Everyone chooses: end the game, or keep playing. There is no deadline.');
+    end;
   end if;
 end $$;
 
+-- Runs close, reveal, then open until nothing moves, so a murder revealed at 09:00 has already taken effect when the
+-- banishment opening at 09:00 counts who is alive (that count decides whether it is the final banishment).
 create or replace function advance_games(p_now timestamptz default now()) returns void language plpgsql security definer set search_path = public as $$
-declare e events; tz text;
+declare e events; tz text; v_alive int; changed boolean; i int := 0;
 begin
-  for e in select ev.* from events ev join games g on g.id = ev.game_id
-           where g.status = 'active' and ev.status = 'scheduled' and ev.opens_at <= p_now
-           order by ev.opens_at loop
-    update events set status = 'open' where id = e.id;
-    -- Murder windows are the traitors' business, so only banishment votes are announced.
-    if e.kind = 'banishment' then
+  loop
+    changed := false; i := i + 1;
+
+    for e in select ev.* from events ev join games g on g.id = ev.game_id
+             where g.status = 'active' and ev.status = 'open' and ev.closes_at <= p_now
+             order by ev.closes_at loop
+      perform close_event(e.id);
+      changed := true;
+    end loop;
+
+    -- Re-checks game status per event: a win mid-catch-up must stop later reveals.
+    for e in select ev.* from events ev join games g on g.id = ev.game_id
+             where g.status = 'active' and ev.status = 'closed' and ev.reveals_at <= p_now
+             order by ev.reveals_at loop
+      if (select status from games where id = e.game_id) = 'active' then
+        perform reveal_event(e.id);
+        changed := true;
+      end if;
+    end loop;
+
+    for e in select ev.* from events ev join games g on g.id = ev.game_id
+             where g.status = 'active' and ev.status = 'scheduled' and ev.opens_at <= p_now
+             order by ev.opens_at loop
+      -- An earlier event in this pass may have ended the game or dropped this one.
+      continue when not exists (select 1 from events x join games g on g.id = x.game_id
+                                where x.id = e.id and x.status = 'scheduled' and g.status = 'active');
       select g.tz into tz from games g where g.id = e.game_id;
-      perform slack_post(format('The banishment vote is open. It closes %s. Not voting counts as abstaining.',
-                                to_char(e.closes_at at time zone tz, 'FMDay "at" HH24:MI')));
-    end if;
+      select count(*) into v_alive from players where game_id = e.game_id and alive;
+      if e.kind = 'banishment' and v_alive <= 6 and (select phase from games where id = e.game_id) = 'normal' then
+        -- First banishment with 6 or fewer alive is the last one; open_final_banishment would add a second event, so
+        -- convert this one instead.
+        update games set phase = 'final' where id = e.game_id;
+        delete from events where game_id = e.game_id and status = 'scheduled' and id <> e.id;
+        update events set status = 'open', untimed = true,
+          closes_at = p_now + interval '10 years', reveals_at = p_now + interval '10 years' where id = e.id;
+        perform slack_post('The final banishment vote is open. There is no deadline: it closes when everyone has voted. Roles are no longer revealed.');
+      else
+        update events set status = 'open' where id = e.id;
+        -- Murder windows are the traitors' business, so only banishment votes are announced.
+        if e.kind = 'banishment' then
+          perform slack_post(format('The banishment vote is open. It closes %s. Not voting counts as abstaining.',
+                                    to_char(e.closes_at at time zone tz, 'FMDay "at" HH24:MI')));
+        end if;
+      end if;
+      changed := true;
+    end loop;
+
+    exit when not changed or i >= 50;
   end loop;
 
   for e in select ev.* from events ev join games g on g.id = ev.game_id
-           where g.status = 'active' and ev.status = 'open' and ev.kind = 'banishment' and not ev.reminded
+           where g.status = 'active' and ev.status = 'open' and ev.kind = 'banishment' and not ev.reminded and not ev.untimed
              and ev.closes_at - interval '3 hours' <= p_now and ev.closes_at > p_now
            order by ev.closes_at loop
     update events set reminded = true where id = e.id;
     select g.tz into tz from games g where g.id = e.game_id;
     perform slack_post(format('Reminder: the banishment vote closes %s. If you have not voted yet, now is the time.',
                               to_char(e.closes_at at time zone tz, 'FMDay "at" HH24:MI')));
-  end loop;
-
-  for e in select ev.* from events ev join games g on g.id = ev.game_id
-           where g.status = 'active' and ev.status = 'open' and ev.closes_at <= p_now
-           order by ev.closes_at loop
-    perform close_event(e.id);
-  end loop;
-
-  -- Re-checks game status per event: a win mid-catch-up must stop later reveals.
-  for e in select ev.* from events ev join games g on g.id = ev.game_id
-           where g.status = 'active' and ev.status = 'closed' and ev.reveals_at <= p_now
-           order by ev.reveals_at loop
-    if (select status from games where id = e.game_id) = 'active' then
-      perform reveal_event(e.id);
-    end if;
   end loop;
 end $$;
 
@@ -508,7 +625,7 @@ begin
   if not is_admin() then raise exception 'admin only'; end if;
   update events
   set closes_at = least(closes_at, now()),
-      reveals_at = case when kind = 'banishment' then least(reveals_at, now()) else reveals_at end
+      reveals_at = case when kind in ('banishment', 'endgame') then least(reveals_at, now()) else reveals_at end
   where id = p_event;
   perform advance_games();
 end $$;
@@ -527,10 +644,35 @@ begin
   delete from games where id = p_game;
 end $$;
 
+-- Starts the final banishment now. Anything open is voided (picks blanked, nobody banished or murdered) and
+-- everything still scheduled is dropped; the end game vote follows the banishment as usual.
+-- My own answer in the end game vote (null until I answer), so the buttons can show what I chose.
+create or replace function my_endgame(p_event uuid) returns boolean language sql stable security definer set search_path = public as $$
+  select a.end_vote from actions a join players p on p.id = a.player_id
+  where a.event_id = p_event and p.user_id = auth.uid()
+$$;
+
+create or replace function gm_start_endgame(p_game uuid) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  if (select status from games where id = p_game) is distinct from 'active' then raise exception 'The game is not running'; end if;
+  if (select phase from games where id = p_game) <> 'normal' then raise exception 'The end game has already started'; end if;
+  delete from events where game_id = p_game and status = 'scheduled';
+  update actions set target_id = null where event_id in (select id from events where game_id = p_game and status = 'open');
+  update events set closes_at = least(closes_at, now()), reveals_at = least(reveals_at, now())
+  where game_id = p_game and status in ('open', 'closed');
+  perform advance_games();
+  if (select status from games where id = p_game) = 'active' then perform open_final_banishment(p_game); end if;
+end $$;
+
 revoke execute on function
   advance_games(timestamptz), close_event(uuid), reveal_event(uuid), check_win(uuid),
+  settle_untimed(uuid), open_final_banishment(uuid),
   internal_start_game(uuid, timestamp, jsonb, int, int)
   from public, anon, authenticated;
+
+revoke execute on function gm_start_endgame(uuid), cast_endgame(uuid, boolean), my_endgame(uuid) from public, anon;
+grant execute on function gm_start_endgame(uuid), cast_endgame(uuid, boolean), my_endgame(uuid) to authenticated;
 
 revoke execute on function
   am_admin(), default_schedule(), create_game(),
@@ -667,17 +809,17 @@ begin
   if not is_admin() then raise exception 'admin only'; end if;
   select * into g from games where id = p_game;
   return jsonb_build_object(
-    'status', g.status,
+    'status', g.status, 'phase', g.phase,
     'alive', (select count(*) from players where game_id = p_game and alive),
     'out', (select count(*) from players where game_id = p_game and not alive),
     'events', coalesce((select jsonb_agg(x order by x ->> 'opens_at') from (
       select jsonb_build_object(
-        'id', e.id, 'kind', e.kind, 'status', e.status,
+        'id', e.id, 'kind', e.kind, 'status', e.status, 'untimed', e.untimed,
         'opens_at', e.opens_at, 'closes_at', e.closes_at, 'reveals_at', e.reveals_at,
-        'voters', case when e.kind = 'banishment' then (select count(*) from players p where p.game_id = e.game_id and p.alive) end,
-        'voted', case when e.kind = 'banishment' then
+        'voters', case when e.kind <> 'murder' then (select count(*) from players p where p.game_id = e.game_id and p.alive) end,
+        'voted', case when e.kind <> 'murder' then
           (select count(*) from actions a join players p on p.id = a.player_id where a.event_id = e.id and p.alive) end,
-        'not_voted', case when e.kind = 'banishment' and e.status = 'open' then coalesce((
+        'not_voted', case when e.kind <> 'murder' and e.status = 'open' then coalesce((
           select jsonb_agg(p.display_name order by p.display_name) from players p
           where p.game_id = e.game_id and p.alive
             and not exists (select 1 from actions a where a.event_id = e.id and a.player_id = p.id)), '[]') end,
