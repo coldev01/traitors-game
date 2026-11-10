@@ -35,7 +35,7 @@ async function loadGame() {
   S.players = pl.data ?? [];
   S.roles = Object.fromEntries((ro.data ?? []).map(r => [r.player_id, r.role]));
   S.events = ev.data ?? [];
-  S.results = Object.fromEntries((re.data ?? []).map(r => [r.event_id, { target: r.target_id, kind: r.kind, accepted: r.accepted }]));
+  S.results = Object.fromEntries((re.data ?? []).map(r => [r.event_id, { target: r.target_id, kind: r.kind, accepted: r.accepted, votes: r.votes }]));
   S.me = S.players.find(p => p.user_id === S.user.id) ?? null;
   S.mine = {}; S.picks = {}; S.messages = []; S.offer = null;
   if (S.me && S.roles[S.me.id] === 'traitor') {
@@ -132,7 +132,9 @@ function timeline() {
       return `<li class="${esc(e.kind)}"><b>${esc(name(r.target))}</b> ${r.accepted ? 'accepted and joined the traitors.' : 'refused. Nobody was murdered.'}</li>`;
     }
     const t = r?.target;
-    return `<li class="${esc(e.kind)}">${t ? `<b>${esc(name(t))}</b> was ${verb}. They were ${esc(S.roles[t] ?? '?')}.` : `Nobody was ${verb}.`}</li>`;
+    // The saved text is the same breakdown Slack gets: a "Votes:" line, then one line per target, then notes.
+    const votes = r?.votes ? `<div class="votes"><b>Votes</b><br>${r.votes.split('\n').slice(1).map(esc).join('<br>')}</div>` : '';
+    return `<li class="${esc(e.kind)}">${t ? `<b>${esc(name(t))}</b> was ${verb}. They were ${esc(S.roles[t] ?? '?')}.` : `Nobody was ${verb}.`}${votes}</li>`;
   }).join('');
   return items ? `<ol class="timeline">${items}</ol>` : '<p class="muted">Nothing has happened yet.</p>';
 }

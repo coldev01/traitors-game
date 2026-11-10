@@ -617,6 +617,79 @@ select tests.throws(format($$select gm_post_message(%L, 'hello')$$, tests.g()), 
 select tests.reset();
 rollback to savepoint s10;
 
+-------------------------------------------------------------------- 11. public vote breakdown
+savepoint s11;
+select set_config('t.g', tests.make_game(8)::text, false);
+create temp table ev (name text primary key, id uuid);
+create function pg_temp.mkb(p_name text) returns void language plpgsql as $$
+declare v uuid;
+begin
+  insert into events (game_id, kind, opens_at, closes_at, reveals_at, status)
+  values (tests.g(), 'banishment', now() - interval '3 hours' - (select count(*) from ev) * interval '1 minute', now() - interval '1 hour', now() - interval '1 hour', 'closed') returning id into v;
+  insert into ev values (p_name, v);
+end $$;
+create function pg_temp.vote(p_event text, p_by text, p_target text) returns void language sql as $$
+  insert into actions (event_id, player_id, target_id)
+  values ((select id from ev where name = p_event), tests.pid(tests.g(), p_by), case when p_target is null then null else tests.pid(tests.g(), p_target) end)
+$$;
+create function pg_temp.bd(p_event text) returns text language sql as $$
+  select vote_breakdown((select id from ev where name = p_event))
+$$;
+
+-- a clear winner: grouped by target, biggest first, with who did not vote
+select pg_temp.mkb('x');
+select pg_temp.vote('x', 'a', 'f'); select pg_temp.vote('x', 'b', 'f'); select pg_temp.vote('x', 'c', 'f'); select pg_temp.vote('x', 'd', 'g');
+select tests.eq(pg_temp.bd('x'), E'Votes:\n• f: 3 (a, b, c)\n• g: 1 (d)\nDid not vote: e, f, g, h.', 'breakdown groups votes by target and lists non-voters');
+
+-- a tie is called out
+select pg_temp.mkb('t');
+select pg_temp.vote('t', 'a', 'f'); select pg_temp.vote('t', 'b', 'g');
+select tests.ok(pg_temp.bd('t') like '%Tie on 1 vote between f and g, decided at random.%', 'a tie is announced as random');
+select tests.ok(pg_temp.bd('x') not like '%Tie%', 'no tie line when there is a clear winner');
+
+-- nothing counted means nothing announced
+select pg_temp.mkb('n');
+select tests.eq(pg_temp.bd('n'), null::text, 'no votes, no breakdown');
+select pg_temp.mkb('s');
+select pg_temp.vote('s', 'a', null); select pg_temp.vote('s', 'b', null);
+select tests.eq(pg_temp.bd('s'), null::text, 'a skipped round (blanked picks) announces no votes');
+
+-- votes that did not count are left out: from a dead voter, for a dead target
+select pg_temp.mkb('d');
+select pg_temp.vote('d', 'a', 'f'); select pg_temp.vote('d', 'b', 'g'); select pg_temp.vote('d', 'c', 'g');
+update players set alive = false where id = tests.pid(tests.g(), 'a');
+update players set alive = false where id = tests.pid(tests.g(), 'g');
+select tests.eq(pg_temp.bd('d'), null::text, 'votes from the dead and for the dead are not shown');
+
+-- clients can never call it
+select set_config('t.evx', (select id::text from ev where name = 'x'), false);
+select tests.act_as('c');
+select tests.throws(format($$select vote_breakdown(%L)$$, current_setting('t.evx')), '42501', 'players cannot call vote_breakdown');
+select tests.reset();
+
+rollback to savepoint s11;
+
+-- a real reveal saves the breakdown with the result, readable by members only once revealed
+savepoint s11b;
+select set_config('t.g', tests.make_game(8)::text, false);
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status) values
+  ('00000000-0000-0000-0000-0000000000d7', tests.g(), 'banishment', now() - interval '5 hours', now() + interval '1 hour', now() + interval '1 hour', 'open');
+insert into actions (event_id, player_id, target_id) values
+  ('00000000-0000-0000-0000-0000000000d7', tests.pid(tests.g(), 'c'), tests.pid(tests.g(), 'f')),
+  ('00000000-0000-0000-0000-0000000000d7', tests.pid(tests.g(), 'd'), tests.pid(tests.g(), 'f')),
+  ('00000000-0000-0000-0000-0000000000d7', tests.pid(tests.g(), 'f'), tests.pid(tests.g(), 'g'));
+select tests.act_as('c');
+select tests.eq((select count(*) from event_results), 0::bigint, 'nothing readable before the reveal');
+select tests.reset();
+select advance_games(now() + interval '2 hours');
+select tests.act_as('c');
+select tests.eq((select votes from event_results where event_id = '00000000-0000-0000-0000-0000000000d7'),
+                E'Votes:\n• f: 2 (c, d)\n• g: 1 (f)\nDid not vote: a, b, e, g, h.', 'members can read the saved breakdown, including the banished player''s own vote');
+select tests.act_as('outsider');
+select tests.eq((select count(*) from event_results), 0::bigint, 'non-members cannot read it');
+select tests.reset();
+rollback to savepoint s11b;
+
 -------------------------------------------------------------------- 5. security / GM
 savepoint s5;
 select set_config('t.g', tests.make_game(8)::text, false);

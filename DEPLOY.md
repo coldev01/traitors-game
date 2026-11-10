@@ -19,7 +19,7 @@
 
 ## 2a. Slack announcements (optional)
 
-Public updates only: a banishment vote opening, a reminder 3 hours before it closes, who was banished or murdered (and their role), and the final result. A recruit round is announced as "Nobody was murdered", exactly as in the app. Nothing secret is ever posted.
+Public updates only: a banishment vote opening, a reminder 3 hours before it closes, who was banished or murdered (and their role), and the final result. A banishment result also lists who voted for whom, who did not vote, and notes a random tie-break. The votes are public once the result is out. A recruit round is announced as "Nobody was murdered", exactly as in the app. Nothing secret is ever posted.
 
 1. Go to https://api.slack.com/apps, **Create New App → From scratch**, pick your workspace.
 2. **Incoming Webhooks** → turn on → **Add New Webhook to Workspace** → choose the channel → copy the URL (it starts `https://hooks.slack.com/`).

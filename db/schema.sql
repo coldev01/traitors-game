@@ -82,6 +82,9 @@ alter table actions add column if not exists kind text not null default 'kill' c
 alter table event_results add column if not exists kind text not null default 'kill' check (kind in ('kill', 'recruit'));
 alter table event_results add column if not exists accepted boolean;
 alter table events add column if not exists reminded boolean not null default false;
+-- The public who-voted-for-whom text, saved at the reveal so the app and Slack show exactly the same thing.
+-- It is only readable once the event is revealed, through the same policy as the result itself.
+alter table event_results add column if not exists votes text;
 -- The GM can speak in the traitors chat. Their messages have no player, so player_id must be nullable;
 -- only post_message (player) and gm_post_message (GM) write here, so the pairing is enforced in those.
 alter table messages alter column player_id drop not null;
@@ -357,10 +360,46 @@ begin
   end;
 end $$;
 
+-- Who voted for whom, for the public announcement. Uses the same rules as close_event (living voters, living
+-- targets) so it shows exactly the votes that counted, and returns null when nothing counted (no votes, or
+-- the GM skipped the round) so nothing is announced. Must run before the result is applied: the banished
+-- player is marked dead there, and their votes would otherwise drop out.
+create or replace function vote_breakdown(p_event uuid) returns text language plpgsql stable security definer set search_path = public as $$
+declare v_game uuid; v_lines text; v_top int; v_tied text; v_missing text;
+begin
+  select game_id into v_game from events where id = p_event;
+  select string_agg(format('• %s: %s (%s)', tname, cnt, voters), E'\n' order by cnt desc, tname), max(cnt)
+  into v_lines, v_top
+  from (select t.display_name as tname, count(*) as cnt, string_agg(voter.display_name, ', ' order by voter.display_name) as voters
+        from actions a
+        join players voter on voter.id = a.player_id and voter.alive
+        join players t on t.id = a.target_id and t.alive
+        where a.event_id = p_event and a.target_id is not null
+        group by t.id, t.display_name) x;
+  if v_lines is null then return null; end if;
+
+  select string_agg(tname, ' and ' order by tname) into v_tied
+  from (select t.display_name as tname, count(*) as cnt
+        from actions a
+        join players voter on voter.id = a.player_id and voter.alive
+        join players t on t.id = a.target_id and t.alive
+        where a.event_id = p_event and a.target_id is not null
+        group by t.id, t.display_name having count(*) = v_top) y;
+
+  select string_agg(p.display_name, ', ' order by p.display_name) into v_missing from players p
+  where p.game_id = v_game and p.alive
+    and not exists (select 1 from actions a where a.event_id = p_event and a.player_id = p.id and a.target_id is not null);
+
+  return 'Votes:' || E'\n' || v_lines
+    || case when v_tied like '% and %' then E'\n' || format('Tie on %s vote%s between %s, decided at random.', v_top, case when v_top = 1 then '' else 's' end, v_tied) else '' end
+    || case when v_missing is not null then E'\n' || 'Did not vote: ' || v_missing || '.' else '' end;
+end $$;
+
 create or replace function reveal_event(p_event uuid) returns void language plpgsql security definer set search_path = public as $$
-declare ev events; v_target uuid; v_kind text; v_accepted boolean; v_name text; v_role text; g games;
+declare ev events; v_target uuid; v_kind text; v_accepted boolean; v_name text; v_role text; g games; v_votes text;
 begin
   select * into ev from events where id = p_event for update;
+  if ev.kind = 'banishment' then v_votes := vote_breakdown(p_event); end if;
   select target_id, kind, accepted into v_target, v_kind, v_accepted from event_results where event_id = p_event;
   if v_target is not null then
     if v_kind = 'kill' then
@@ -371,15 +410,18 @@ begin
     end if;
   end if;
   update events set status = 'revealed' where id = p_event;
+  if v_votes is not null then update event_results set votes = v_votes where event_id = p_event; end if;
 
   -- A recruit round is announced as a quiet one so the faithful can't tell it apart.
   if v_target is not null and v_kind = 'kill' then
     select p.display_name, r.role into v_name, v_role from players p join roles r on r.player_id = p.id where p.id = v_target;
     perform slack_post(format('%s was %s. They were %s.', v_name,
       case ev.kind when 'banishment' then 'banished' else 'murdered' end,
-      case v_role when 'traitor' then 'a traitor' else 'faithful' end));
+      case v_role when 'traitor' then 'a traitor' else 'faithful' end)
+      || coalesce(E'\n' || v_votes, ''));
   else
-    perform slack_post(format('Nobody was %s.', case ev.kind when 'banishment' then 'banished' else 'murdered' end));
+    perform slack_post(format('Nobody was %s.', case ev.kind when 'banishment' then 'banished' else 'murdered' end)
+      || coalesce(E'\n' || v_votes, ''));
   end if;
 
   perform check_win(ev.game_id);
@@ -663,6 +705,7 @@ begin
 end $$;
 
 revoke execute on function slack_post(text) from public, anon, authenticated;
+revoke execute on function vote_breakdown(uuid) from public, anon, authenticated;
 revoke execute on function gm_set_slack(text), gm_slack_test() from public, anon;
 grant execute on function gm_set_slack(text), gm_slack_test() to authenticated;
 
