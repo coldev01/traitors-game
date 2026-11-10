@@ -76,6 +76,13 @@ create table if not exists people (
 );
 alter table people enable row level security;
 
+-- Team photos people can choose from (files live in avatars/<key>.webp). Add a row and a file to add a photo.
+-- Each photo can belong to only one person.
+create table if not exists photos (key text primary key);
+alter table photos enable row level security;
+insert into photos (key) select 'team-' || lpad(n::text, 2, '0') from generate_series(1, 17) n on conflict do nothing;
+create unique index if not exists people_avatar_key_key on people (avatar_key) where avatar_key is not null;
+
 -- Recruitment: a murder window can end in a recruit offer instead of a kill. accepted stays null until
 -- the target answers; null at reveal counts as a refusal.
 alter table actions add column if not exists kind text not null default 'kill' check (kind in ('kill', 'recruit'));
@@ -521,6 +528,42 @@ grant execute on function
   is_admin(), my_player(uuid), in_game(uuid), is_traitor(uuid)
   to authenticated;
 
+create or replace function my_person() returns jsonb language sql stable security definer set search_path = public as $$
+  select to_jsonb(x) from (select display_name as name, email, avatar_key from people where user_id = auth.uid()) x
+$$;
+
+create or replace function photo_gallery() returns jsonb language sql stable security definer set search_path = public as $$
+  select coalesce(jsonb_agg(jsonb_build_object(
+      'key', f.key,
+      'taken', exists (select 1 from people p where p.avatar_key = f.key and p.user_id <> auth.uid()),
+      'mine', exists (select 1 from people p where p.avatar_key = f.key and p.user_id = auth.uid())) order by f.key), '[]')
+  from photos f where exists (select 1 from people where user_id = auth.uid())
+$$;
+
+-- Choosing a photo updates every game they are already in, so the grid never shows a stale picture.
+create or replace function set_my_photo(p_key text) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not exists (select 1 from people where user_id = auth.uid()) then raise exception 'not allowed'; end if;
+  if not exists (select 1 from photos where key = p_key) then raise exception 'That photo does not exist'; end if;
+  begin
+    update people set avatar_key = p_key where user_id = auth.uid();
+  exception when unique_violation then
+    raise exception 'That photo has already been taken';
+  end;
+  update players set avatar_key = p_key where user_id = auth.uid();
+end $$;
+
+-- If someone picked the wrong face, the GM clears it and they choose again.
+create or replace function gm_reset_photo(p_user uuid) returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  update people set avatar_key = null where user_id = p_user;
+  update players set avatar_key = null where user_id = p_user;
+end $$;
+
+revoke execute on function my_person(), photo_gallery(), set_my_photo(text), gm_reset_photo(uuid) from public, anon;
+grant execute on function my_person(), photo_gallery(), set_my_photo(text), gm_reset_photo(uuid) to authenticated;
+
 -- The GM isn't a player, so RLS hides players/events from them; this is their only window in.
 create or replace function gm_overview(p_game uuid) returns jsonb language plpgsql stable security definer set search_path = public as $$
 begin
@@ -530,7 +573,7 @@ begin
     'signup_code', (select value from app_config where key = 'signup_code'),
     'slack_on', exists (select 1 from app_config where key = 'slack_webhook'),
     'people', coalesce((select jsonb_agg(jsonb_build_object(
-                'user_id', p.user_id, 'name', p.display_name, 'email', p.email,
+                'user_id', p.user_id, 'name', p.display_name, 'email', p.email, 'avatar_key', p.avatar_key,
                 'in_game', exists (select 1 from players g where g.game_id = p_game and g.user_id = p.user_id))
                 order by p.display_name) from people p), '[]'),
     'events', coalesce((select jsonb_agg(to_jsonb(e) order by e.opens_at)

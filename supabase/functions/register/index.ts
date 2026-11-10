@@ -37,7 +37,8 @@ Deno.serve(async (req) => {
   }
 
   const { error: perr } = await admin.from('people').insert({
-    user_id: created.user.id, email: cleanEmail, display_name: cleanName, avatar_key: cleanEmail.split('@')[0],
+    // No photo yet: the person chooses one from the gallery after registering.
+    user_id: created.user.id, email: cleanEmail, display_name: cleanName,
   });
   if (perr) {
     await admin.auth.admin.deleteUser(created.user.id);

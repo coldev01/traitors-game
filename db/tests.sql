@@ -690,6 +690,60 @@ select tests.eq((select count(*) from event_results), 0::bigint, 'non-members ca
 select tests.reset();
 rollback to savepoint s11b;
 
+-------------------------------------------------------------------- 12. choosing a photo
+savepoint s12;
+select tests.make_user('gm'), tests.make_user('outsider');
+insert into admins values ('gm@org.test');
+select tests.add_people(3);
+
+select tests.act_as('p1');
+select tests.eq(jsonb_array_length(photo_gallery()), 17, 'the gallery lists all 17 photos');
+select tests.eq((select count(*) from jsonb_array_elements(photo_gallery()) x where (x ->> 'taken')::boolean), 0::bigint, 'nothing is taken yet');
+select tests.lives($$select set_my_photo('team-01')$$, 'a person chooses a photo');
+select tests.eq(my_person() ->> 'avatar_key', 'team-01', 'their choice is saved');
+select tests.ok((select (x ->> 'mine')::boolean from jsonb_array_elements(photo_gallery()) x where x ->> 'key' = 'team-01'), 'the gallery marks their own photo');
+
+select tests.act_as('p2');
+select tests.ok((select (x ->> 'taken')::boolean from jsonb_array_elements(photo_gallery()) x where x ->> 'key' = 'team-01'), 'a taken photo shows as taken to others');
+select tests.throws($$select set_my_photo('team-01')$$, 'already been taken', 'two people cannot share a photo');
+select tests.throws($$select set_my_photo('team-99')$$, 'does not exist', 'unknown photos are refused');
+select tests.throws($$select set_my_photo('../../etc/passwd')$$, 'does not exist', 'a path is not a photo key');
+select tests.lives($$select set_my_photo('team-02')$$, 'a second person chooses another photo');
+select tests.lives($$select set_my_photo('team-03')$$, 'they can change their mind');
+select tests.act_as('p3');
+select tests.lives($$select set_my_photo('team-02')$$, 'a freed photo can be chosen by someone else');
+
+-- people who have not registered cannot use it
+select tests.act_as('outsider');
+select tests.eq(photo_gallery(), '[]'::jsonb, 'non-registered users see an empty gallery');
+select tests.throws($$select set_my_photo('team-05')$$, 'not allowed', 'non-registered users cannot choose');
+select tests.as_anon();
+select tests.throws($$select photo_gallery()$$, '42501', 'signed-out visitors cannot call it');
+
+-- changing a photo updates games they are already in
+select tests.act_as('gm');
+select set_config('t.g', create_game()::text, false);
+select gm_set_player(tests.g(), tests.uid('p1'), true);
+select tests.reset();
+select tests.eq((select avatar_key from players where game_id = tests.g()), 'team-01', 'a player starts with their chosen photo');
+select tests.act_as('p1');
+select set_my_photo('team-09');
+select tests.reset();
+select tests.eq((select avatar_key from players where game_id = tests.g()), 'team-09', 'changing it updates their games too');
+
+-- the GM can reset a wrong choice
+select tests.act_as('p2');
+select tests.throws(format($$select gm_reset_photo(%L)$$, tests.uid('p1')), 'admin only', 'players cannot reset anyone''s photo');
+select tests.act_as('gm');
+select tests.lives(format($$select gm_reset_photo(%L)$$, tests.uid('p1')), 'the GM resets a photo');
+select tests.reset();
+select tests.eq((select avatar_key from people where user_id = tests.uid('p1')), null::text, 'the person has no photo again');
+select tests.eq((select avatar_key from players where game_id = tests.g()), null::text, 'and neither does their player row');
+select tests.act_as('p2');
+select tests.lives($$select set_my_photo('team-09')$$, 'the reset photo is free again');
+select tests.reset();
+rollback to savepoint s12;
+
 -------------------------------------------------------------------- 5. security / GM
 savepoint s5;
 select set_config('t.g', tests.make_game(8)::text, false);
