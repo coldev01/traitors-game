@@ -472,8 +472,7 @@ function view() {
          <input id="rpw2" type="password" placeholder="Confirm password" autocomplete="new-password">
          <input id="rcode" placeholder="Signup code"><button data-act="register">Register</button></div>`;
     return `<div class="auth"><div class="hero"><h1>Traitors</h1><p>Banishments, murders and bluffing, played in spare minutes over a few weeks.</p></div>
-      <div class="seg">${tab('signin', 'Sign in')}${tab('register', 'Register')}</div>${form}
-      <div class="foot"><img src="assets/dev-logo.svg" alt="DEV" width="124" height="56"></div></div>`;
+      <div class="seg">${tab('signin', 'Sign in')}${tab('register', 'Register')}</div>${form}</div>`;
   }
   if (S.recovery) return `<h2 style="margin-top:0">Choose a new password</h2><div class="form"><input id="np1" type="password" placeholder="New password (8+ characters)" autocomplete="new-password">
     <input id="np2" type="password" placeholder="Confirm new password" autocomplete="new-password"><button data-act="newpw">Save password</button></div>`;
