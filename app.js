@@ -152,6 +152,19 @@ function archivedList() {
   return `<h2>Archived games</h2><ul class="archive">${items}</ul>`;
 }
 
+// The quiet screens: no game yet, in the lobby, or not added. One wax seal, a line that sets the mood, and how the game works.
+function waitingView(title, extra = '', start = ['Now you are registered, the game master can add you to the next game.', 'They then choose the traitors and the game begins.']) {
+  return `<div class="waiting"><span class="seal big">?</span><h1>${title}</h1>${extra}
+    <div class="rules"><h3>How the game starts</h3><ul>${start.map(t => `<li>${t}</li>`).join('')}</ul>
+    <h3 class="next">How it works</h3><ul>
+      <li>Twice a week the group will choose to banish one player.</li>
+      <li>Twice a week the traitors choose a victim, or recruit someone to join them.</li>
+      <li>The faithful hunt the traitors. The traitors blend in and wait.</li>
+      <li>Near the end, we enter the end game, where roles are no longer revealed.</li>
+      <li>It finishes when only two remain, or all players agree to end the game. Who will win, the traitors or the faithful?</li>
+    </ul></div></div>`;
+}
+
 function playerGrid() {
   const mineTraitor = S.me && S.roles[S.me.id] === 'traitor';
   const murdered = murderedIds();
@@ -236,8 +249,7 @@ function murderView(e) {
   const mode = (k, label) => `<button class="ghost ${kind === k ? 'active' : ''}" data-act="votekind" data-kind="${k}">${label}</button>`;
   return `<div class="votebar"><h2>${canRecruit ? 'Murder or recruit' : 'Choose a victim'}</h2>${clock}
     ${canRecruit ? `<div class="seg" style="margin:0 0 12px">${mode('kill', 'Murder')}${mode('recruit', 'Recruit')}</div>` : ''}
-    <div class="row"><button data-act="cast" data-ev="${esc(e.id)}" ${picked || sel === 'none' ? '' : 'disabled'}>${picked ? `${canRecruit ? verb + ' ' : 'Murder '}${esc(picked.display_name)}` : sel === 'none' ? 'Confirm: no murder' : 'Confirm'}</button>
-    <button class="ghost ${sel === 'none' ? 'active' : ''}" data-act="nomurder">No murder</button>
+    <div class="row"><button data-act="cast" data-ev="${esc(e.id)}" ${picked ? '' : 'disabled'}>${picked ? `${canRecruit ? verb + ' ' : 'Murder '}${esc(picked.display_name)}` : 'Confirm'}</button>
     <button class="ghost" data-act="voteback">Back</button></div>
     ${kind === 'recruit' && canRecruit ? '<p class="muted choice">They can refuse, and then nothing happens.</p>' : ''}</div>
     <div class="tiles">${tiles}</div>`;
@@ -482,11 +494,14 @@ function view() {
   if (S.admin && S.gmPick) return gmPickerView();
   if (!S.admin && S.person && ((!S.person.avatar_key && !S.skipPhoto) || S.picking)) return pickerView();
   const g = S.game;
-  if (!g) return S.admin ? `<p>No game yet.</p><button data-act="create">Create game</button>${archivedList()}` : `<p>No game yet. Check back soon.</p>`;
+  if (!g) return S.admin ? `<p>No game yet.</p><button data-act="create">Create game</button>${archivedList()}` : waitingView('The doors are closed.');
   if (g.status === 'lobby') {
     if (S.admin) return S.lobbyStep === 'traitors' ? traitorsStep() : playersStep();
-    return S.me ? `<h2>Lobby</h2><p class="muted">Waiting for the game master to start.</p>${playerGrid()}`
-                : `<p>You haven't been added to this game yet. Ask the game master.</p>`;
+    const n = S.players.length;
+    return S.me ? waitingView('You are at the table.',
+                  `<h2>${n} ${n === 1 ? 'player' : 'players'} so far</h2>${playerGrid()}`,
+                  ['You are registered and the game master has added you to this game.', 'They now choose the traitors and the game begins.'])
+                : waitingView('Not at the table yet.', '<p class="muted">The game master has not added you to this game. Ask them to tick your name.</p>');
   }
   if (g.status === 'finished') {
     return `${winnerHero()}${playerGrid()}<h2>What happened</h2>${timeline()}${S.admin ? gmPanel() : ''}${S.admin ? '<div class="gm-actions"><button data-act="create">New game</button></div>' + archivedList() : ''}`;
@@ -656,9 +671,9 @@ const actions = {
   create: () => { S.lobbyStep = 'players'; return call('create_game'); },
   start: () => call('start_game', { p_game: S.game.id }),
   votescreen: el => {
-    const m = S.mine[el.dataset.ev], murder = S.events.find(x => x.id === el.dataset.ev)?.kind === 'murder';
+    const m = S.mine[el.dataset.ev];
     S.voting = el.dataset.ev; S.error = '';
-    S.voteSel = m?.target ?? (murder && m ? 'none' : null);
+    S.voteSel = m?.target ?? null;
     S.voteKind = m?.kind === 'recruit' ? 'recruit' : 'kill';
     render();
   },
@@ -668,12 +683,11 @@ const actions = {
     render();
   },
   votekind: el => { S.voteKind = el.dataset.kind; render(); },
-  nomurder: () => { S.voteSel = 'none'; render(); },
   voteback: () => { S.voting = null; render(); },
   cast: async el => {
     if (!S.voteSel) return;
     const murder = S.events.find(x => x.id === el.dataset.ev)?.kind === 'murder';
-    const target = S.voteSel === 'none' ? null : S.voteSel;
+    const target = S.voteSel;
     await call(murder ? (S.voteKind === 'recruit' && target ? 'pick_recruit' : 'pick_victim') : 'cast_vote', { p_event: el.dataset.ev, p_target: target });
     if (!S.error) { S.voting = null; render(); }
   },
