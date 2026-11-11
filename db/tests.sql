@@ -1072,5 +1072,21 @@ select tests.reset();
 select tests.eq((select archived from games where id = tests.g()), true, 'the GM archives a finished game');
 rollback to savepoint s15;
 
+-------------------------------------------------------------------- 16. deleting a game that has votes and chat
+savepoint s16;
+insert into admins values ('gm@org.test') on conflict do nothing;
+select set_config('t.g', tests.make_game(6)::text, false);
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status) values
+  ('00000000-0000-0000-0000-0000000000e1', tests.g(), 'banishment', now(), now() + interval '1 day', now() + interval '1 day', 'open');
+insert into actions (event_id, player_id, target_id) values
+  ('00000000-0000-0000-0000-0000000000e1', tests.pid(tests.g(), 'a'), tests.pid(tests.g(), 'b')),
+  ('00000000-0000-0000-0000-0000000000e1', tests.pid(tests.g(), 'b'), tests.pid(tests.g(), 'a'));
+insert into messages (game_id, player_id, body) values (tests.g(), tests.pid(tests.g(), 'a'), 'hello');
+select tests.act_as('gm');
+select gm_delete_game(tests.g());
+select tests.reset();
+select tests.eq((select count(*) from games where id = tests.g()), 0::bigint, 'a game with votes and chat can be deleted');
+rollback to savepoint s16;
+
 rollback;
 select 'all tests passed' as result;

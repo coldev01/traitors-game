@@ -45,14 +45,14 @@ create table if not exists events (
 create table if not exists event_results (
   event_id uuid primary key references events on delete cascade,
   game_id uuid not null references games on delete cascade,
-  target_id uuid references players
+  target_id uuid references players on delete set null
 );
 
 create table if not exists actions (
   id uuid primary key default gen_random_uuid(),
   event_id uuid not null references events on delete cascade,
   player_id uuid not null references players on delete cascade,
-  target_id uuid references players,
+  target_id uuid references players on delete set null,
   created_at timestamptz not null default now(),
   unique (event_id, player_id)
 );
@@ -61,7 +61,7 @@ create table if not exists messages (
   id bigint generated always as identity primary key,
   game_id uuid not null references games on delete cascade,
   channel text not null default 'traitors' check (channel in ('traitors')),
-  player_id uuid not null references players,
+  player_id uuid not null references players on delete cascade,
   body text not null check (char_length(body) between 1 and 500),
   created_at timestamptz not null default clock_timestamp()
 );
@@ -118,6 +118,10 @@ alter table players add column if not exists revealed boolean not null default f
 alter table players add column if not exists revealed_at timestamptz;
 alter table players add column if not exists role_public boolean not null default true;
 alter table actions add column if not exists end_vote boolean;
+-- Without these, deleting a game that has votes or chat fails: the cascade removes players but these rows still point at them.
+alter table actions drop constraint if exists actions_target_id_fkey, add constraint actions_target_id_fkey foreign key (target_id) references players on delete set null;
+alter table event_results drop constraint if exists event_results_target_id_fkey, add constraint event_results_target_id_fkey foreign key (target_id) references players on delete set null;
+alter table messages drop constraint if exists messages_player_id_fkey, add constraint messages_player_id_fkey foreign key (player_id) references players on delete cascade;
 alter table events drop constraint if exists events_kind_check;
 alter table events add constraint events_kind_check check (kind in ('banishment', 'murder', 'endgame'));
 
