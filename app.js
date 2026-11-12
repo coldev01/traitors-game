@@ -100,6 +100,7 @@ const FRIENDLY = [
   [/invalid target/i, 'You cannot choose that player.'],
   [/not allowed/i, 'You are not allowed to do that.'],
   [/no offer/i, 'There is no offer to answer any more.'],
+  [/missing email or phone/i, 'Enter your email and password.'],
   [/invalid login credentials/i, 'That email and password do not match.'],
   [/jwt expired|invalid jwt/i, 'Your sign-in has expired. Please sign in again.'],
   [/failed to fetch|networkerror|load failed/i, 'Could not reach the server. Check your connection and try again.'],
@@ -592,6 +593,7 @@ function tick() {
 const actions = {
   login: () => actions.loginWith(document.getElementById('email').value.trim(), document.getElementById('pw').value),
   loginWith: async (email, password) => {
+    if (!email || !password) { S.error = 'Enter your email and password.'; return render(); }
     const { error } = await sb.auth.signInWithPassword({ email, password });
     S.error = error?.message ?? '';
     await refresh();
