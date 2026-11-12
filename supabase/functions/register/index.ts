@@ -9,6 +9,12 @@ const cors = {
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { ...cors, 'Content-Type': 'application/json' } });
 
+// Control characters, including line breaks and the two Unicode line separators.
+const badChar = (c: string) => {
+  const n = c.charCodeAt(0);
+  return n < 32 || (n >= 127 && n <= 159) || n === 0x2028 || n === 0x2029;
+};
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: cors });
 
@@ -17,7 +23,7 @@ Deno.serve(async (req) => {
   const cleanName = String(name ?? '').trim();
   if (!cleanEmail || !cleanName || !password || !code) return json({ error: 'All fields are required' }, 400);
   // Names end up in Slack posts and the vote breakdown, which is split on line breaks (the database enforces this too).
-  if (cleanName.length > 40 || /[\u0001-\u001f\u007f-\u009f\u2028\u2029]/.test(cleanName)) {
+  if (cleanName.length > 40 || [...cleanName].some(badChar)) {
     return json({ error: 'Name must be 1 to 40 characters, with no line breaks' }, 400);
   }
   if (String(password).length < 8) return json({ error: 'Password must be at least 8 characters' }, 400);
