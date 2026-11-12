@@ -230,8 +230,15 @@ select tests.eq((select count(*) from events where game_id = tests.g()), 48::big
 select tests.eq((select opens_at from events where game_id = tests.g() and kind = 'banishment' order by opens_at limit 1),
                 '2026-10-19 09:00:00+01'::timestamptz, 'first banishment opens Mon 09:00 London');
 select tests.eq((select closes_at from events where game_id = tests.g() and kind = 'murder' order by opens_at limit 1),
-                '2026-10-21 09:00:00+01'::timestamptz, 'murder 1 closes Wed 09:00');
+                '2026-10-21 00:00:00+01'::timestamptz, 'murder 1 closes Wed 00:00');
+select tests.eq((select reveals_at from events where game_id = tests.g() and kind = 'murder' order by opens_at limit 1),
+                '2026-10-21 09:00:00+01'::timestamptz, 'murder 1 is revealed Wed 09:00');
+select tests.ok((select bool_and(reveals_at - closes_at >= interval '6 hours') from events where game_id = tests.g() and kind = 'murder'), 'murders reveal at least 6 hours after they close');
+select tests.eq((select picks_close_at from events where game_id = tests.g() and kind = 'murder' order by opens_at limit 1),
+                '2026-10-20 14:00:00+01'::timestamptz, 'the traitors must decide by Tue 14:00');
+select tests.ok((select bool_and(closes_at = reveals_at) from events where game_id = tests.g() and kind = 'banishment'), 'banishments reveal when they close');
 select tests.eq((select count(*) from events where game_id = tests.g() and extract(isodow from opens_at at time zone 'Europe/London') > 4), 0::bigint, 'nothing opens Fri-Sun');
+select tests.eq((select count(*) from events where game_id = tests.g() and (extract(isodow from closes_at at time zone 'Europe/London') > 4 or extract(isodow from reveals_at at time zone 'Europe/London') > 4)), 0::bigint, 'nothing closes or reveals Fri-Sun');
 select tests.act_as('gm');
 select tests.throws(format($$select gm_set_player(%L, %L, false)$$, tests.g(), tests.uid('p1')), 'game not in lobby', 'cannot change players once started');
 select tests.reset();
@@ -403,11 +410,12 @@ select tests.eq((select count(*) from players where game_id = tests.g() and not 
 rollback to savepoint s4b;
 
 -------------------------------------------------------------------- 6. recruitment
+-- The traitors choose by majority; a recruit becomes a traitor the moment it is locked and can refuse until the window closes.
 savepoint s6;
 select set_config('t.g', tests.make_game(8)::text, false);
 select tests.set_traitors(tests.g(), '{a,b}');
-insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status) values
-  ('00000000-0000-0000-0000-0000000000d1', tests.g(), 'murder', now() - interval '1 hour', now() + interval '1 hour', now() + interval '5 hours', 'open');
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status, picks_close_at) values
+  ('00000000-0000-0000-0000-0000000000d1', tests.g(), 'murder', now() - interval '1 hour', now() + interval '1 hour', now() + interval '5 hours', 'open', now() + interval '30 minutes');
 
 select tests.act_as('c');
 select tests.throws(format($$select pick_recruit('00000000-0000-0000-0000-0000000000d1', %L)$$, tests.pid(tests.g(), 'd')), 'not allowed', 'faithful cannot recruit');
@@ -415,77 +423,120 @@ select tests.act_as('a');
 select tests.throws(format($$select pick_recruit('00000000-0000-0000-0000-0000000000d1', %L)$$, tests.pid(tests.g(), 'b')), 'invalid target', 'cannot recruit a traitor');
 select tests.lives(format($$select pick_recruit('00000000-0000-0000-0000-0000000000d1', %L)$$, tests.pid(tests.g(), 'c')), 'traitor picks a recruit');
 select tests.eq((select kind from my_pick('00000000-0000-0000-0000-0000000000d1')), 'recruit', 'pick is recorded as a recruit');
+select tests.eq((select count(*) from murder_locks), 0::bigint, 'one of two traitors is not a majority');
 select tests.act_as('b');
 select tests.lives(format($$select pick_recruit('00000000-0000-0000-0000-0000000000d1', %L)$$, tests.pid(tests.g(), 'c')), 'second traitor agrees');
+select tests.eq((select count(*) from murder_locks where kind = 'recruit'), 1::bigint, 'both agreeing locks the recruit');
+select tests.throws(format($$select pick_recruit('00000000-0000-0000-0000-0000000000d1', %L)$$, tests.pid(tests.g(), 'd')), 'event not open', 'no more picks once locked');
 select tests.reset();
-
--- window closes: offer exists for c only, nobody has died, no reveal yet
-select advance_games(now() + interval '2 hours');
-select tests.eq((select kind from event_results where event_id = '00000000-0000-0000-0000-0000000000d1'), 'recruit', 'closed as a recruit offer');
-select tests.eq((select count(*) from players where game_id = tests.g() and not alive), 0::bigint, 'recruit round kills nobody');
+select tests.eq((select role from roles where player_id = tests.pid(tests.g(), 'c')), 'traitor', 'the recruit is a traitor straight away');
 select tests.act_as('c');
-select tests.ok(my_offer(tests.g()) is not null, 'target sees the offer');
+select tests.ok(my_offer(tests.g()) is not null, 'the recruit sees the offer');
 select tests.act_as('d');
 select tests.ok(my_offer(tests.g()) is null, 'others see no offer');
-select tests.throws($$select respond_recruit('00000000-0000-0000-0000-0000000000d1', true)$$, 'no offer', 'non-target cannot answer');
-select tests.act_as('c');
-select tests.lives($$select respond_recruit('00000000-0000-0000-0000-0000000000d1', true)$$, 'target accepts');
-select tests.throws($$select respond_recruit('00000000-0000-0000-0000-0000000000d1', false)$$, 'no offer', 'answer cannot be changed');
+select tests.eq((select count(*) from murder_locks), 0::bigint, 'faithful cannot see the lock');
+select tests.throws($$select respond_recruit('00000000-0000-0000-0000-0000000000d1', false)$$, 'no offer', 'non-target cannot answer');
 select tests.reset();
 
--- reveal: c is now a traitor, nobody died, and non-traitors cannot see the result
+-- the recruit says nothing: the window closes, nobody dies, and they stay a traitor
+select advance_games(now() + interval '2 hours');
+select tests.ok((select kind = 'kill' and target_id is null from event_results where event_id = '00000000-0000-0000-0000-0000000000d1'), 'the public result looks like a quiet round');
+select tests.eq((select count(*) from players where game_id = tests.g() and not alive), 0::bigint, 'recruit round kills nobody');
+select tests.act_as('c');
+select tests.ok(my_offer(tests.g()) is null, 'the offer ends when the window closes');
+select tests.throws($$select respond_recruit('00000000-0000-0000-0000-0000000000d1', false)$$, 'no offer', 'too late to refuse');
+select tests.reset();
 select advance_games(now() + interval '6 hours');
-select tests.eq((select role from roles where player_id = tests.pid(tests.g(), 'c')), 'traitor', 'accepted recruit becomes a traitor');
+select tests.eq((select role from roles where player_id = tests.pid(tests.g(), 'c')), 'traitor', 'no answer: they stay a traitor');
 select tests.eq((select count(*) from players where game_id = tests.g() and not alive), 0::bigint, 'still nobody dead');
 select tests.act_as('d');
-select tests.eq((select count(*) from event_results), 0::bigint, 'faithful cannot see a recruit result');
+select tests.eq((select count(*) from recruit_offers), 0::bigint, 'faithful cannot see a recruit offer');
+select tests.eq((select count(*) from event_results where target_id is null and kind = 'kill'), 1::bigint, 'faithful see an ordinary quiet round, same as no murder');
 select tests.act_as('a');
-select tests.eq((select count(*) from event_results), 1::bigint, 'traitors can see it');
+select tests.eq((select count(*) from recruit_offers), 1::bigint, 'traitors can see the offer');
 select tests.act_as('c');
-select tests.eq((select count(*) from roles), 3::bigint, 'recruit now sees both fellow traitors and self');
+select tests.eq((select count(*) from roles), 3::bigint, 'recruit sees both fellow traitors and self');
 select tests.reset();
 rollback to savepoint s6;
 
--------------------------------------------------------------------- 6b. refusal, silence, limit
+-------------------------------------------------------------------- 6b. refusing a recruitment gets the recruit murdered
 savepoint s6b;
 select set_config('t.g', tests.make_game(8)::text, false);
 select tests.set_traitors(tests.g(), '{a,b}');
-insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status) values
-  ('00000000-0000-0000-0000-0000000000d2', tests.g(), 'murder', now() - interval '1 hour', now() + interval '1 hour', now() + interval '5 hours', 'open');
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status, picks_close_at) values
+  ('00000000-0000-0000-0000-0000000000d2', tests.g(), 'murder', now() - interval '1 hour', now() + interval '1 hour', now() + interval '5 hours', 'open', now() + interval '30 minutes');
 select tests.act_as('a');
 select pick_recruit('00000000-0000-0000-0000-0000000000d2', tests.pid(tests.g(), 'c'));
-select tests.reset();
-select advance_games(now() + interval '2 hours');
+select tests.act_as('b');
+select pick_recruit('00000000-0000-0000-0000-0000000000d2', tests.pid(tests.g(), 'c'));
 select tests.act_as('c');
 select respond_recruit('00000000-0000-0000-0000-0000000000d2', false);
+select tests.throws($$select respond_recruit('00000000-0000-0000-0000-0000000000d2', false)$$, 'no offer', 'an answer cannot be changed');
 select tests.reset();
+select tests.eq((select role from roles where player_id = tests.pid(tests.g(), 'c')), 'faithful', 'refusing makes them faithful again at once');
+select advance_games(now() + interval '2 hours');
+select tests.eq((select alive from players where id = tests.pid(tests.g(), 'c')), true, 'the refuser is still alive until the reveal');
 select advance_games(now() + interval '6 hours');
-select tests.eq((select role from roles where player_id = tests.pid(tests.g(), 'c')), 'faithful', 'refusal leaves them faithful');
-select tests.eq((select count(*) from players where game_id = tests.g() and not alive), 0::bigint, 'refusal kills nobody');
+select tests.eq((select alive from players where id = tests.pid(tests.g(), 'c')), false, 'the refuser is murdered at the reveal');
+select tests.ok((select role_public from players where id = tests.pid(tests.g(), 'c')), 'their role is shown');
+select tests.eq((select count(*) from roles r join players p on p.id = r.player_id where r.role = 'traitor' and p.game_id = tests.g()), 2::bigint, 'the traitors are back to the original two');
 rollback to savepoint s6b;
 
+-------------------------------------------------------------------- 6c. the traitors' deadline
 savepoint s6c;
 select set_config('t.g', tests.make_game(8)::text, false);
 select tests.set_traitors(tests.g(), '{a,b}');
-insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status) values
-  ('00000000-0000-0000-0000-0000000000d3', tests.g(), 'murder', now() - interval '1 hour', now() + interval '1 hour', now() + interval '5 hours', 'open');
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status, picks_close_at) values
+  ('00000000-0000-0000-0000-0000000000d3', tests.g(), 'murder', now() - interval '1 hour', now() + interval '3 hours', now() + interval '8 hours', 'open', now() + interval '30 minutes'),
+  ('00000000-0000-0000-0000-0000000000d5', tests.g(), 'murder', now() + interval '10 hours', now() + interval '13 hours', now() + interval '18 hours', 'scheduled', now() + interval '11 hours');
 select tests.act_as('a');
-select pick_recruit('00000000-0000-0000-0000-0000000000d3', tests.pid(tests.g(), 'c'));
+select pick_victim('00000000-0000-0000-0000-0000000000d3', tests.pid(tests.g(), 'd'));
+select tests.act_as('b');
+select pick_victim('00000000-0000-0000-0000-0000000000d3', tests.pid(tests.g(), 'e'));
 select tests.reset();
-select advance_games(now() + interval '2 hours');
-select advance_games(now() + interval '6 hours');
-select tests.eq((select role from roles where player_id = tests.pid(tests.g(), 'c')), 'faithful', 'no answer counts as a refusal');
+select tests.eq((select count(*) from murder_locks), 0::bigint, 'split traitors: nothing locked yet');
+select advance_games(now() + interval '20 minutes');
+select tests.eq((select count(*) from murder_locks), 0::bigint, 'still open before the deadline');
+select advance_games(now() + interval '31 minutes');
+select tests.ok((select target_id in (tests.pid(tests.g(), 'd'), tests.pid(tests.g(), 'e')) from murder_locks where event_id = '00000000-0000-0000-0000-0000000000d3'), 'at the deadline one of the suggestions goes ahead');
+select tests.act_as('a');
+select tests.throws(format($$select pick_victim('00000000-0000-0000-0000-0000000000d3', %L)$$, tests.pid(tests.g(), 'f')), 'event not open', 'no picks after the deadline');
+select tests.reset();
+select advance_games(now() + interval '4 hours');
+select advance_games(now() + interval '9 hours');
+select tests.eq((select count(*) from players where game_id = tests.g() and not alive), 1::bigint, 'the locked victim is murdered');
+-- the next murder: nobody picks, the deadline locks "nobody"
+select advance_games(now() + interval '10 hours 30 minutes');
+select advance_games(now() + interval '11 hours 5 minutes');
+select tests.ok((select target_id is null and kind = 'kill' from murder_locks where event_id = '00000000-0000-0000-0000-0000000000d5'), 'no picks at the deadline locks nobody');
 rollback to savepoint s6c;
 
+-------------------------------------------------------------------- 6d. limits, and majorities with more traitors
 savepoint s6d;
 select set_config('t.g', tests.make_game(8)::text, false);
 select tests.set_traitors(tests.g(), '{a,b,c}');
-insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status) values
-  ('00000000-0000-0000-0000-0000000000d4', tests.g(), 'murder', now() - interval '1 hour', now() + interval '1 hour', now() + interval '5 hours', 'open');
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status, picks_close_at) values
+  ('00000000-0000-0000-0000-0000000000d4', tests.g(), 'murder', now() - interval '1 hour', now() + interval '1 hour', now() + interval '5 hours', 'open', now() + interval '30 minutes');
 select tests.act_as('a');
 select tests.throws(format($$select pick_recruit('00000000-0000-0000-0000-0000000000d4', %L)$$, tests.pid(tests.g(), 'd')), 'recruitment not available', 'no recruiting with 3 traitors');
+select pick_victim('00000000-0000-0000-0000-0000000000d4', tests.pid(tests.g(), 'd'));
+select tests.eq((select count(*) from murder_locks), 0::bigint, 'one of three is not a majority');
+select tests.act_as('b');
+select pick_victim('00000000-0000-0000-0000-0000000000d4', tests.pid(tests.g(), 'd'));
 select tests.reset();
+select tests.eq((select target_id from murder_locks), tests.pid(tests.g(), 'd'), 'two of three locks the murder');
 rollback to savepoint s6d;
+
+savepoint s6e;
+select set_config('t.g', tests.make_game(8)::text, false);
+select tests.set_traitors(tests.g(), '{a}');
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status, picks_close_at) values
+  ('00000000-0000-0000-0000-0000000000d6', tests.g(), 'murder', now() - interval '1 hour', now() + interval '1 hour', now() + interval '5 hours', 'open', now() + interval '30 minutes');
+select tests.act_as('a');
+select pick_recruit('00000000-0000-0000-0000-0000000000d6', tests.pid(tests.g(), 'c'));
+select tests.reset();
+select tests.eq((select role from roles where player_id = tests.pid(tests.g(), 'c')), 'traitor', 'a lone traitor recruits at once');
+rollback to savepoint s6e;
 
 -------------------------------------------------------------------- 7. slack announcements
 savepoint s7;
@@ -1087,6 +1138,82 @@ select gm_delete_game(tests.g());
 select tests.reset();
 select tests.eq((select count(*) from games where id = tests.g()), 0::bigint, 'a game with votes and chat can be deleted');
 rollback to savepoint s16;
+
+-------------------------------------------------------------------- 17. names, new games, repeated runs
+savepoint s17;
+insert into admins values ('gm@org.test') on conflict do nothing;
+select set_config('t.g', tests.make_game(6)::text, false);
+update games set status = 'lobby' where id = tests.g();
+insert into people (user_id, email, display_name) select user_id, email, display_name from players where game_id = tests.g();
+select tests.act_as('a');
+select tests.throws(format($$select set_name(%L, E'x\nVotes: forged')$$, tests.uid('a')), 'line breaks', 'no line breaks in a name');
+select tests.throws(format($$select set_name(%L, %L)$$, tests.uid('a'), repeat('x', 41)), '1 to 40', 'at most 40 characters');
+select tests.throws(format($$select set_name(%L, 'B')$$, tests.uid('a')), 'taken', 'names are unique ignoring case');
+select tests.lives(format($$select set_name(%L, 'Alice')$$, tests.uid('a')), 'a name can change in the lobby');
+select tests.reset();
+update games set status = 'active' where id = tests.g();
+select tests.act_as('a');
+select tests.throws(format($$select set_name(%L, 'Alicia')$$, tests.uid('a')), 'locked', 'names are locked while a game runs');
+select tests.act_as('gm');
+select tests.lives(format($$select set_name(%L, 'Alicia')$$, tests.uid('a')), 'the GM can still fix a name');
+select tests.reset();
+select tests.throws(format($$update people set display_name = E'bad\nname' where user_id = %L$$, tests.uid('a')), 'people_name_ok', 'the database refuses control characters too');
+
+-- a new game cannot be created over a running one, and a finished one is archived for the GM
+select tests.act_as('gm');
+select tests.throws($$select create_game()$$, 'already', 'no new game while one is running');
+select tests.reset();
+update games set status = 'finished', winner = 'faithful' where id = tests.g();
+select tests.act_as('gm');
+select tests.lives($$select create_game()$$, 'a new game after a finished one');
+select tests.reset();
+select tests.eq((select archived from games where id = tests.g()), true, 'the finished game is archived automatically');
+rollback to savepoint s17;
+
+-- running the close and reveal steps twice does nothing the second time
+savepoint s17b;
+select set_config('t.g', tests.make_game(6)::text, false);
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status) values
+  ('00000000-0000-0000-0000-0000000000f1', tests.g(), 'banishment', now() - interval '2 days', now() - interval '1 day', now() - interval '1 day', 'open');
+insert into actions (event_id, player_id, target_id) values
+  ('00000000-0000-0000-0000-0000000000f1', tests.pid(tests.g(), 'a'), tests.pid(tests.g(), 'b')),
+  ('00000000-0000-0000-0000-0000000000f1', tests.pid(tests.g(), 'c'), tests.pid(tests.g(), 'b'));
+select close_event('00000000-0000-0000-0000-0000000000f1');
+select tests.lives($$select close_event('00000000-0000-0000-0000-0000000000f1')$$, 'closing twice is harmless');
+select tests.eq((select count(*) from event_results where event_id = '00000000-0000-0000-0000-0000000000f1'), 1::bigint, 'one result, not two');
+select reveal_event('00000000-0000-0000-0000-0000000000f1');
+select tests.lives($$select reveal_event('00000000-0000-0000-0000-0000000000f1')$$, 'revealing twice is harmless');
+select tests.eq((select count(*) from players where game_id = tests.g() and not alive), 1::bigint, 'still one player out');
+rollback to savepoint s17b;
+
+-- a repeat reveal after a final banishment must not open a second end game vote
+savepoint s17c;
+select set_config('t.g', tests.make_game(6)::text, false);
+select tests.set_traitors(tests.g(), array['a']);
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at) values
+  ('00000000-0000-0000-0000-0000000000f2', tests.g(), 'banishment', now() - interval '1 minute', now() + interval '1 day', now() + interval '1 day');
+select advance_games();
+select tests.vote_all('00000000-0000-0000-0000-0000000000f2', array['a', 'c', 'd', 'e', 'f'], 'b');
+select tests.vote_all('00000000-0000-0000-0000-0000000000f2', array['b'], 'a');
+select tests.eq((select count(*) from events where game_id = tests.g() and kind = 'endgame'), 1::bigint, 'one end game vote opens');
+select reveal_event('00000000-0000-0000-0000-0000000000f2');
+select tests.eq((select count(*) from events where game_id = tests.g() and kind = 'endgame'), 1::bigint, 'a repeat reveal does not open a second end game vote');
+rollback to savepoint s17c;
+
+-- an old-format recruit round (saved before offers moved to recruit_offers) is migrated and stops being public
+savepoint s17d;
+select set_config('t.g', tests.make_game(6)::text, false);
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status) values
+  ('00000000-0000-0000-0000-0000000000f3', tests.g(), 'murder', now() - interval '3 hours', now() - interval '2 hours', now() + interval '5 hours', 'closed');
+insert into event_results (event_id, game_id, target_id, kind) values
+  ('00000000-0000-0000-0000-0000000000f3', tests.g(), tests.pid(tests.g(), 'c'), 'recruit');
+-- the same statements schema.sql runs on every deploy
+insert into recruit_offers (event_id, game_id, target_id, accepted)
+  select event_id, game_id, target_id, accepted from event_results where kind = 'recruit' on conflict do nothing;
+update event_results set kind = 'kill', target_id = null where kind = 'recruit';
+select tests.eq((select target_id from recruit_offers where event_id = '00000000-0000-0000-0000-0000000000f3'), tests.pid(tests.g(), 'c'), 'the offer moved to recruit_offers');
+select tests.ok((select kind = 'kill' and target_id is null from event_results where event_id = '00000000-0000-0000-0000-0000000000f3'), 'the public row now looks like a quiet round');
+rollback to savepoint s17d;
 
 rollback;
 select 'all tests passed' as result;

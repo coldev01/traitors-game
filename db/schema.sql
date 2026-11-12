@@ -48,6 +48,26 @@ create table if not exists event_results (
   target_id uuid references players on delete set null
 );
 
+-- A recruit round is stored in event_results as an ordinary "nobody was murdered" row, so non-traitors can't tell it
+-- apart. The real offer lives here, readable only by traitors (and its target, through my_offer).
+create table if not exists recruit_offers (
+  event_id uuid primary key references events on delete cascade,
+  game_id uuid not null references games on delete cascade,
+  target_id uuid references players on delete set null,
+  accepted boolean
+);
+alter table recruit_offers enable row level security;
+
+-- What the traitors locked in for a murder window: a murder, a recruit, or nothing (target null). Kept out of events,
+-- which every player can read, so the faithful can't see whether a recruit is under way.
+create table if not exists murder_locks (
+  event_id uuid primary key references events on delete cascade,
+  game_id uuid not null references games on delete cascade,
+  kind text not null check (kind in ('kill', 'recruit')),
+  target_id uuid references players on delete set null
+);
+alter table murder_locks enable row level security;
+
 create table if not exists actions (
   id uuid primary key default gen_random_uuid(),
   event_id uuid not null references events on delete cascade,
@@ -92,11 +112,17 @@ alter table photos enable row level security;
 insert into photos (key) select 'team-' || lpad(n::text, 2, '0') from generate_series(1, 21) n on conflict do nothing;
 create unique index if not exists people_avatar_key_key on people (avatar_key) where avatar_key is not null;
 
--- Recruitment: a murder window can end in a recruit offer instead of a kill. accepted stays null until
--- the target answers; null at reveal counts as a refusal.
+-- Recruitment: when the traitors lock in a recruit the target becomes a traitor at once, and has until the window
+-- closes to refuse. accepted stays null until they answer; refusing turns them faithful again and they are murdered.
+-- The traitors choose by majority until picks_close_at; after that a random one of their picks goes ahead.
+alter table events add column if not exists picks_close_at timestamptz;
 alter table actions add column if not exists kind text not null default 'kill' check (kind in ('kill', 'recruit'));
 alter table event_results add column if not exists kind text not null default 'kill' check (kind in ('kill', 'recruit'));
 alter table event_results add column if not exists accepted boolean;
+-- Rounds saved before recruit offers moved here: move them over so they stop showing as public results.
+insert into recruit_offers (event_id, game_id, target_id, accepted)
+  select event_id, game_id, target_id, accepted from event_results where kind = 'recruit' on conflict do nothing;
+update event_results set kind = 'kill', target_id = null where kind = 'recruit';
 alter table events add column if not exists reminded boolean not null default false;
 -- The public who-voted-for-whom text, saved at the reveal so the app and Slack show exactly the same thing.
 -- It is only readable once the event is revealed, through the same policy as the result itself.
@@ -114,6 +140,12 @@ alter table games add column if not exists phase text not null default 'normal' 
 alter table events add column if not exists untimed boolean not null default false;
 alter table games add column if not exists revealing boolean not null default false;
 alter table games add column if not exists archived boolean not null default false;
+-- Names end up in Slack posts and the vote breakdown (which is split on line breaks), so no control characters, and no
+-- two people can share a name (ignoring case).
+alter table people drop constraint if exists people_name_ok;
+alter table people add constraint people_name_ok check (
+  char_length(display_name) between 1 and 40 and display_name !~ '[\u0001-\u001f\u007f-\u009f\u2028\u2029]') not valid; -- checks new and changed rows, so an old name can't stop a re-run
+create unique index if not exists people_display_name_unique on people (lower(display_name));
 alter table players add column if not exists revealed boolean not null default false;
 alter table players add column if not exists revealed_at timestamptz;
 alter table players add column if not exists role_public boolean not null default true;
@@ -177,29 +209,40 @@ drop policy if exists results_select on event_results;
 create policy results_select on event_results for select to authenticated using (
   (in_game(game_id) or is_admin())
   and exists (select 1 from events e where e.id = event_id and e.status = 'revealed')
-  and (kind = 'kill' or is_traitor(game_id))
 );
+
+drop policy if exists murder_locks_select on murder_locks;
+create policy murder_locks_select on murder_locks for select to authenticated using (is_traitor(game_id));
+drop policy if exists recruit_offers_select on recruit_offers;
+create policy recruit_offers_select on recruit_offers for select to authenticated using (is_traitor(game_id));
 
 drop policy if exists messages_select on messages;
 create policy messages_select on messages for select to authenticated using (is_traitor(game_id));
 
 create or replace function am_admin() returns boolean language sql stable as $$ select is_admin() $$;
 
--- Offsets are minutes from Monday 00:00 local time. Murder 1 closes Wed 24:00 (= Thu 00:00);
--- murder 2 spans the weekend and closes Mon 24:00 (= Tue 00:00 next week).
+-- Offsets are minutes from Monday 00:00 local time. In a murder window the traitors must decide by 'lock' (14:00 on the
+-- day it opens); a recruit then has until the window closes to refuse. Murder 1 closes Wed 00:00 and murder 2 closes
+-- Mon 00:00 (the next week); nothing opens or closes on a Friday, Saturday or Sunday.
 create or replace function default_schedule() returns jsonb language sql immutable as $$
-  -- Everything opens/closes Mon-Thu 09:00, never Fri-Sun (the team is off alternate Fridays). Murder 2 spans the weekend.
+  -- Votes open and close Mon-Thu 09:00; murders close at midnight and are revealed at 09:00. Never Fri-Sun (the team is off
+  -- alternate Fridays). Murder 2 spans the weekend.
   select jsonb_build_array(
     jsonb_build_object('kind', 'banishment', 'open', 540,  'close', 1980, 'reveal', 1980),
-    jsonb_build_object('kind', 'murder',     'open', 1980, 'close', 3420, 'reveal', 3420),
+    jsonb_build_object('kind', 'murder',     'open', 1980, 'close', 2880, 'reveal', 3420, 'lock', 2280),
     jsonb_build_object('kind', 'banishment', 'open', 3420, 'close', 4860, 'reveal', 4860),
-    jsonb_build_object('kind', 'murder',     'open', 4860, 'close', 10620, 'reveal', 10620))
+    jsonb_build_object('kind', 'murder',     'open', 4860, 'close', 10080, 'reveal', 10620, 'lock', 5160))
 $$;
 
 create or replace function create_game() returns uuid language plpgsql security definer set search_path = public as $$
 declare v uuid;
 begin
   if not is_admin() then raise exception 'admin only'; end if;
+  if exists (select 1 from games where status in ('lobby', 'active') and not archived) then
+    raise exception 'A game is already waiting or running. Finish or delete it first.';
+  end if;
+  -- A finished game is put away automatically, so it never vanishes from every screen.
+  update games set archived = true where status = 'finished' and not archived;
   insert into games default values returning id into v;
   return v;
 end $$;
@@ -234,11 +277,12 @@ begin
 
   v_anchor := coalesce(p_anchor, date_trunc('week', now() at time zone g.tz) + interval '7 days');
   -- ponytail: events are pre-generated for p_weeks (12); a game longer than that needs a top-up function.
-  insert into events (game_id, kind, opens_at, closes_at, reveals_at)
+  insert into events (game_id, kind, opens_at, closes_at, reveals_at, picks_close_at)
   select p_game, s ->> 'kind',
     (v_anchor + make_interval(mins => w * p_period + (s ->> 'open')::int)) at time zone g.tz,
     (v_anchor + make_interval(mins => w * p_period + (s ->> 'close')::int)) at time zone g.tz,
-    (v_anchor + make_interval(mins => w * p_period + (s ->> 'reveal')::int)) at time zone g.tz
+    (v_anchor + make_interval(mins => w * p_period + (s ->> 'reveal')::int)) at time zone g.tz,
+    (v_anchor + make_interval(mins => w * p_period + (s ->> 'lock')::int)) at time zone g.tz
   from generate_series(0, p_weeks - 1) w, jsonb_array_elements(coalesce(p_schedule, default_schedule())) s;
 
   update games set status = 'active' where id = p_game;
@@ -259,7 +303,11 @@ create or replace function settle_untimed(p_event uuid) returns void language pl
 declare ev events;
 begin
   select * into ev from events where id = p_event;
-  if ev.id is null or not ev.untimed or ev.status <> 'open' then return; end if;
+  if ev.id is null or not ev.untimed then return; end if;
+  -- Same lock as advance_games: if the last two answers land together, the second one to get here sees both.
+  perform pg_advisory_xact_lock(727001);
+  select * into ev from events where id = p_event;
+  if ev.status <> 'open' then return; end if;
   if not exists (select 1 from players p where p.game_id = ev.game_id and p.alive and not exists (
         select 1 from actions a where a.event_id = p_event and a.player_id = p.id
           and (a.target_id is not null or a.end_vote is not null))) then
@@ -282,6 +330,8 @@ end $$;
 create or replace function cast_vote(p_event uuid, p_target uuid) returns void language plpgsql security definer set search_path = public as $$
 declare ev events; me uuid;
 begin
+  -- Lock first, before touching any event row: taking it after a row lock can deadlock with advance_games.
+  perform pg_advisory_xact_lock(727001);
   select * into ev from events where id = p_event;
   if ev.id is null or ev.kind <> 'banishment' or ev.status <> 'open' or now() >= ev.closes_at then
     raise exception 'event not open';
@@ -300,6 +350,8 @@ end $$;
 create or replace function cast_endgame(p_event uuid, p_end boolean) returns void language plpgsql security definer set search_path = public as $$
 declare ev events; me uuid;
 begin
+  -- Lock first, before touching any event row: taking it after a row lock can deadlock with advance_games.
+  perform pg_advisory_xact_lock(727001);
   select * into ev from events where id = p_event;
   if ev.id is null or ev.kind <> 'endgame' or ev.status <> 'open' then raise exception 'event not open'; end if;
   me := my_player(ev.game_id);
@@ -313,8 +365,10 @@ end $$;
 create or replace function pick_victim(p_event uuid, p_target uuid) returns void language plpgsql security definer set search_path = public as $$
 declare ev events; me uuid;
 begin
+  perform pg_advisory_xact_lock(727001); -- the pick that makes a majority locks the round, so picks can't interleave
   select * into ev from events where id = p_event;
-  if ev.id is null or ev.kind <> 'murder' or ev.status <> 'open' or now() >= ev.closes_at then
+  if ev.id is null or ev.kind <> 'murder' or ev.status <> 'open' or now() >= least(ev.closes_at, coalesce(ev.picks_close_at, ev.closes_at))
+     or exists (select 1 from murder_locks where event_id = p_event) then
     raise exception 'event not open';
   end if;
   me := my_player(ev.game_id);
@@ -328,13 +382,16 @@ begin
   end if;
   insert into actions (event_id, player_id, target_id, kind) values (p_event, me, p_target, 'kill')
   on conflict (event_id, player_id) do update set target_id = excluded.target_id, kind = 'kill', created_at = now();
+  perform lock_murder(p_event, false);
 end $$;
 
 create or replace function pick_recruit(p_event uuid, p_target uuid) returns void language plpgsql security definer set search_path = public as $$
 declare ev events; me uuid;
 begin
+  perform pg_advisory_xact_lock(727001);
   select * into ev from events where id = p_event;
-  if ev.id is null or ev.kind <> 'murder' or ev.status <> 'open' or now() >= ev.closes_at then
+  if ev.id is null or ev.kind <> 'murder' or ev.status <> 'open' or now() >= least(ev.closes_at, coalesce(ev.picks_close_at, ev.closes_at))
+     or exists (select 1 from murder_locks where event_id = p_event) then
     raise exception 'event not open';
   end if;
   me := my_player(ev.game_id);
@@ -352,6 +409,43 @@ begin
   end if;
   insert into actions (event_id, player_id, target_id, kind) values (p_event, me, p_target, 'recruit')
   on conflict (event_id, player_id) do update set target_id = excluded.target_id, kind = 'recruit', created_at = now();
+  perform lock_murder(p_event, false);
+end $$;
+
+-- Settles what the traitors chose for a murder window. Called after every pick and at the deadline (p_force).
+-- A choice with more than half the living traitors behind it locks at once; at the deadline the most-picked choice
+-- wins, a tie is settled at random, and no picks at all locks "nobody". A recruit makes the target a traitor now,
+-- and they have until the window closes to refuse (respond_recruit).
+create or replace function lock_murder(p_event uuid, p_force boolean) returns void language plpgsql security definer set search_path = public as $$
+declare ev events; v_n int; v_kind text; v_target uuid; v_votes int;
+begin
+  select * into ev from events where id = p_event for no key update;
+  if ev.id is null or ev.kind <> 'murder' or ev.status <> 'open'
+     or exists (select 1 from murder_locks where event_id = p_event) then return; end if;
+  select count(*) into v_n from players p join roles r on r.player_id = p.id
+  where p.game_id = ev.game_id and p.alive and r.role = 'traitor';
+  select a.kind, a.target_id, count(*) into v_kind, v_target, v_votes
+  from actions a
+  join players voter on voter.id = a.player_id and voter.alive
+  join roles vr on vr.player_id = voter.id and vr.role = 'traitor'
+  join players t on t.id = a.target_id and t.alive
+  where a.event_id = p_event and a.target_id is not null
+  group by a.kind, a.target_id
+  order by count(*) desc, random()
+  limit 1;
+  if v_target is null then
+    if not p_force then return; end if;
+    v_kind := 'kill'; -- the deadline passed with no picks
+  elsif v_votes * 2 <= v_n and not p_force then
+    return;
+  end if;
+  -- Traitors may have grown back past the limit since they picked, so re-check.
+  if v_kind = 'recruit' and v_n > 2 then v_kind := 'kill'; v_target := null; end if;
+  insert into murder_locks (event_id, game_id, kind, target_id) values (p_event, ev.game_id, v_kind, v_target);
+  if v_kind = 'recruit' then
+    update roles set role = 'traitor' where player_id = v_target;
+    insert into recruit_offers (event_id, game_id, target_id) values (p_event, ev.game_id, v_target);
+  end if;
 end $$;
 
 create or replace function post_message(p_game uuid, p_body text) returns void language plpgsql security definer set search_path = public as $$
@@ -377,23 +471,28 @@ create or replace function team_picks(p_event uuid) returns table (player_id uui
   where a.event_id = p_event and e.kind = 'murder' and is_traitor(e.game_id)
 $$;
 
--- The recruit offer is private to its target and open from the window closing until the reveal.
+-- The recruit is already a traitor. They can refuse until the murder window closes, and refusing gets them murdered.
 create or replace function my_offer(p_game uuid) returns uuid language sql stable security definer set search_path = public as $$
-  select r.event_id from event_results r
+  select r.event_id from recruit_offers r
   join events e on e.id = r.event_id
   join players p on p.id = r.target_id
-  where r.game_id = p_game and r.kind = 'recruit' and r.accepted is null
-    and e.status = 'closed' and p.alive and p.user_id = auth.uid()
+  where r.game_id = p_game and r.accepted is null
+    and e.status = 'open' and p.alive and p.user_id = auth.uid()
   limit 1
 $$;
 
 create or replace function respond_recruit(p_event uuid, p_accept boolean) returns void language plpgsql security definer set search_path = public as $$
+declare v_target uuid;
 begin
-  update event_results r set accepted = p_accept
+  perform pg_advisory_xact_lock(727001);
+  update recruit_offers r set accepted = p_accept
   from events e, players p
   where r.event_id = p_event and e.id = r.event_id and p.id = r.target_id
-    and r.kind = 'recruit' and r.accepted is null and e.status = 'closed' and p.alive and p.user_id = auth.uid();
-  if not found then raise exception 'no offer'; end if;
+    and r.accepted is null and e.status = 'open' and now() < e.closes_at and p.alive and p.user_id = auth.uid()
+  returning r.target_id into v_target;
+  if v_target is null then raise exception 'no offer'; end if;
+  -- Refusing undoes the recruitment, so the murder that follows shows them as faithful and the faithful learn nothing.
+  if not p_accept then update roles set role = 'faithful' where player_id = v_target; end if;
 end $$;
 
 -- The game ends only at 2 players left (the end game vote handles the rest). Parity or an empty traitor side does
@@ -461,7 +560,8 @@ end $$;
 create or replace function close_event(p_event uuid) returns void language plpgsql security definer set search_path = public as $$
 declare ev events; v_target uuid; v_kind text;
 begin
-  select * into ev from events where id = p_event for update;
+  select * into ev from events where id = p_event for no key update; -- not 'for update': that would block on a voter's insert
+  if ev.status <> 'open' then return; end if; -- another run already closed it
   if ev.kind = 'endgame' then
     -- accepted means "everyone alive chose to end it"; no answer counts as keep playing.
     insert into event_results (event_id, game_id, target_id, kind, accepted)
@@ -471,21 +571,25 @@ begin
     update events set status = 'closed' where id = p_event;
     return;
   end if;
-  select a.target_id, a.kind into v_target, v_kind
-  from actions a
-  join players voter on voter.id = a.player_id and voter.alive
-  join players t on t.id = a.target_id and t.alive
-  where a.event_id = p_event and a.target_id is not null
-  group by a.kind, a.target_id
-  order by count(*) desc, random()
-  limit 1;
-  -- Traitors may have grown back past the limit since they picked (a recruit already landed), so re-check.
-  if v_kind = 'recruit' and (select count(*) from players p join roles r on r.player_id = p.id
-                             where p.game_id = ev.game_id and p.alive and r.role = 'traitor') > 2 then
-    v_target := null;
+  if ev.kind = 'murder' then
+    perform lock_murder(p_event, true); -- a window forced shut before the traitors' deadline still gets its choice settled
+    select l.kind, l.target_id into v_kind, v_target from murder_locks l where l.event_id = p_event;
+    -- A recruit round is public as a quiet one, unless the recruit refused: then they are murdered.
+    if v_kind = 'recruit' then
+      select case when o.accepted is false then o.target_id end into v_target from recruit_offers o where o.event_id = p_event;
+    end if;
+    if not exists (select 1 from players where id = v_target and alive) then v_target := null; end if;
+  else
+    select a.target_id into v_target
+    from actions a
+    join players voter on voter.id = a.player_id and voter.alive
+    join players t on t.id = a.target_id and t.alive
+    where a.event_id = p_event and a.target_id is not null
+    group by a.target_id
+    order by count(*) desc, random()
+    limit 1;
   end if;
-  insert into event_results (event_id, game_id, target_id, kind)
-  values (p_event, ev.game_id, v_target, case when v_target is null then 'kill' else coalesce(v_kind, 'kill') end);
+  insert into event_results (event_id, game_id, target_id, kind) values (p_event, ev.game_id, v_target, 'kill');
   update events set status = 'closed' where id = p_event;
 end $$;
 
@@ -546,7 +650,8 @@ create or replace function reveal_event(p_event uuid) returns void language plpg
 declare ev events; v_target uuid; v_kind text; v_accepted boolean; v_name text; v_role text; g games; v_votes text;
         v_alive int; v_show_role boolean;
 begin
-  select * into ev from events where id = p_event for update;
+  select * into ev from events where id = p_event for no key update; -- not 'for update': that would block on a voter's insert
+  if ev.status <> 'closed' then return; end if; -- another run already revealed it
 
   if ev.kind = 'endgame' then
     select accepted into v_accepted from event_results where event_id = p_event;
@@ -562,23 +667,18 @@ begin
   end if;
 
   if ev.kind = 'banishment' then v_votes := vote_breakdown(p_event); end if;
-  select target_id, kind, accepted into v_target, v_kind, v_accepted from event_results where event_id = p_event;
+  select target_id, kind into v_target, v_kind from event_results where event_id = p_event;
   select count(*) into v_alive from players where game_id = ev.game_id and alive;
   -- Murder victims are always faithful, so only banishments can hide anything: from 6 alive down, no role is shown.
   v_show_role := ev.kind = 'murder' or v_alive >= 7;
   if v_target is not null then
-    if v_kind = 'kill' then
-      update players set alive = false, role_public = v_show_role where id = v_target;
-    elsif v_accepted is true then
-      -- A target banished between the offer and the reveal can't be recruited.
-      update roles set role = 'traitor' where player_id = v_target and exists (select 1 from players where id = v_target and alive);
-    end if;
+    update players set alive = false, role_public = v_show_role where id = v_target;
   end if;
   update events set status = 'revealed' where id = p_event;
   if v_votes is not null then update event_results set votes = v_votes where event_id = p_event; end if;
 
-  -- A recruit round is announced as a quiet one so the faithful can't tell it apart.
-  if v_target is not null and v_kind = 'kill' then
+  -- A recruit round has no public target, so it is announced as a quiet one and the faithful can't tell it apart.
+  if v_target is not null then
     select p.display_name, r.role into v_name, v_role from players p join roles r on r.player_id = p.id where p.id = v_target;
     perform slack_post(format('%s was %s.', v_name, case ev.kind when 'banishment' then 'banished' else 'murdered' end)
       || case when v_show_role then format(' They were %s.', case v_role when 'traitor' then 'a traitor' else 'faithful' end) else '' end
@@ -609,8 +709,19 @@ end $$;
 create or replace function advance_games(p_now timestamptz default now()) returns void language plpgsql security definer set search_path = public as $$
 declare e events; tz text; v_alive int; changed boolean; i int := 0;
 begin
+  -- One run at a time: the cron job, a GM button and the last vote can all arrive together.
+  perform pg_advisory_xact_lock(727001);
   loop
     changed := false; i := i + 1;
+
+    -- The traitors' deadline: settle what they chose so a recruit can start refusing.
+    for e in select ev.* from events ev join games g on g.id = ev.game_id
+             where g.status = 'active' and ev.status = 'open' and ev.kind = 'murder' and ev.picks_close_at <= p_now
+               and not exists (select 1 from murder_locks l where l.event_id = ev.id)
+             order by ev.picks_close_at loop
+      perform lock_murder(e.id, true);
+      changed := true;
+    end loop;
 
     for e in select ev.* from events ev join games g on g.id = ev.game_id
              where g.status = 'active' and ev.status = 'open' and ev.closes_at <= p_now
@@ -676,6 +787,8 @@ select cron.schedule('advance-games', '* * * * *', $$select public.advance_games
 create or replace function gm_force_close(p_event uuid) returns void language plpgsql security definer set search_path = public as $$
 begin
   if not is_admin() then raise exception 'admin only'; end if;
+  -- Lock first, before touching any event row: taking it after a row lock can deadlock with advance_games.
+  perform pg_advisory_xact_lock(727001);
   update events
   set closes_at = least(closes_at, now()),
       reveals_at = case when kind in ('banishment', 'endgame') then least(reveals_at, now()) else reveals_at end
@@ -718,6 +831,8 @@ $$;
 create or replace function gm_start_endgame(p_game uuid) returns void language plpgsql security definer set search_path = public as $$
 begin
   if not is_admin() then raise exception 'admin only'; end if;
+  -- Lock first, before touching any event row: taking it after a row lock can deadlock with advance_games.
+  perform pg_advisory_xact_lock(727001);
   if (select status from games where id = p_game) is distinct from 'active' then raise exception 'The game is not running'; end if;
   if (select phase from games where id = p_game) <> 'normal' or (select revealing from games where id = p_game) then raise exception 'The end game has already started'; end if;
   delete from events where game_id = p_game and status = 'scheduled';
@@ -730,7 +845,7 @@ end $$;
 
 revoke execute on function
   advance_games(timestamptz), close_event(uuid), reveal_event(uuid), check_win(uuid),
-  settle_untimed(uuid), open_final_banishment(uuid), begin_reveal(uuid), finish_if_revealed(uuid), do_reveal(uuid),
+  settle_untimed(uuid), lock_murder(uuid, boolean), open_final_banishment(uuid), begin_reveal(uuid), finish_if_revealed(uuid), do_reveal(uuid),
   internal_start_game(uuid, timestamp, jsonb, int, int)
   from public, anon, authenticated;
 
@@ -823,8 +938,19 @@ create or replace function set_name(p_user uuid, p_name text) returns void langu
 declare n text := btrim(p_name);
 begin
   if p_user <> auth.uid() and not is_admin() then raise exception 'not allowed'; end if;
-  if n is null or length(n) not between 1 and 40 then raise exception 'Name must be 1 to 40 characters'; end if;
-  update people set display_name = n where user_id = p_user;
+  if n is null or length(n) not between 1 and 40 or n ~ '[\u0001-\u001f\u007f-\u009f\u2028\u2029]' then
+    raise exception 'Name must be 1 to 40 characters, with no line breaks';
+  end if;
+  -- Locked while playing, so nobody can take another player's name mid-game. The GM can still fix a mistake.
+  if not is_admin() and exists (select 1 from players p join games g on g.id = p.game_id
+                                where p.user_id = p_user and g.status = 'active') then
+    raise exception 'Names are locked while a game is running. Ask the game master.';
+  end if;
+  begin
+    update people set display_name = n where user_id = p_user;
+  exception when unique_violation then
+    raise exception 'That name is already taken';
+  end;
   update players set display_name = n where user_id = p_user;
 end $$;
 revoke execute on function set_name(uuid, text) from public, anon;
@@ -937,6 +1063,8 @@ create or replace function gm_skip_event(p_event uuid) returns void language plp
 declare ev events;
 begin
   if not is_admin() then raise exception 'admin only'; end if;
+  -- Lock first, before touching any event row: taking it after a row lock can deadlock with advance_games.
+  perform pg_advisory_xact_lock(727001);
   select * into ev from events where id = p_event;
   if ev.id is null or ev.status <> 'open' then raise exception 'Only an open event can be skipped'; end if;
   update actions set target_id = null where event_id = p_event;
@@ -983,8 +1111,8 @@ begin
                        left join players t on t.id = a.target_id
                        where e.game_id = p_game and e.status in ('open', 'closed')), '[]'),
     'offers', coalesce((select jsonb_agg(jsonb_build_object('event_id', r.event_id, 'target', t.display_name, 'accepted', r.accepted))
-                        from event_results r join events e on e.id = r.event_id join players t on t.id = r.target_id
-                        where r.game_id = p_game and r.kind = 'recruit' and e.status = 'closed'), '[]'));
+                        from recruit_offers r join events e on e.id = r.event_id join players t on t.id = r.target_id
+                        where r.game_id = p_game and e.status in ('open', 'closed')), '[]'));
 end $$;
 
 create or replace function gm_chat(p_game uuid) returns jsonb language plpgsql stable security definer set search_path = public as $$

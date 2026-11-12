@@ -5,15 +5,30 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const app = document.getElementById('app');
 const S = { user: null, admin: false, game: null, me: null, players: [], roles: {}, events: [], results: {},
-            messages: [], mine: {}, picks: {}, overview: null, dash: null, secrets: null, gmchat: [], curtain: false, person: null, gallery: [], picking: false, skipPhoto: false, gmPick: null, lobbyStep: 'players', tab: 'game', error: '', notice: '', authTab: 'signin', peek: false, archived: [], archiveData: {}, openArchive: null, offer: null, recovery: false, voting: null, voteSel: null, voteKind: 'kill' };
+            messages: [], mine: {}, picks: {}, overview: null, dash: null, secrets: null, gmchat: [], curtain: false, person: null, gallery: [], picking: false, skipPhoto: false, gmPick: null, lobbyStep: 'players', tab: 'game', error: '', notice: '', authTab: 'signin', peek: false, archived: [], archiveData: {}, openArchive: null, offer: null, recovery: false, recruits: {}, netError: false, voting: null, voteSel: null, voteKind: 'kill' };
 
-// Display names come from Google profiles, so every interpolated value goes through esc().
+// Names are chosen by the players, so every interpolated value goes through esc().
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const name = id => S.players.find(p => p.id === id)?.display_name ?? '?';
 const isOpen = e => e.status === 'open' && new Date(e.closes_at) > new Date();
 const countdown = iso => `<span data-t="${esc(iso)}"></span>`;
 
+// One refresh at a time: the 10 s timer and a button press can overlap, and an older answer must not overwrite a newer one.
+let refreshing = false, refreshAgain = false;
+const NET_MSG = 'Could not reach the game just now. Showing what we had; retrying.';
 async function refresh() {
+  if (refreshing) { refreshAgain = true; return; }
+  refreshing = true;
+  try {
+    do {
+      refreshAgain = false;
+      try { await doRefresh(); if (S.netError) { S.netError = false; if (S.error === NET_MSG) S.error = ''; render(); } }
+      catch (err) { console.error(err); S.netError = true; if (!S.error) S.error = NET_MSG; render(); }
+    } while (refreshAgain);
+  } finally { refreshing = false; }
+}
+
+async function doRefresh() {
   const { data: { session } } = await sb.auth.getSession();
   S.user = session?.user ?? null;
   if (S.user) {
@@ -23,7 +38,8 @@ async function refresh() {
       S.person = (await sb.rpc('my_person')).data ?? null;
       if (S.person && (!S.person.avatar_key || S.picking)) S.gallery = (await sb.rpc('photo_gallery')).data ?? [];
     }
-    const { data } = await sb.from('games').select('*').eq('archived', false).order('created_at', { ascending: false }).limit(1);
+    const { data, error } = await sb.from('games').select('*').eq('archived', false).order('created_at', { ascending: false }).limit(1);
+    if (error) throw error;
     S.game = data?.[0] ?? null;
     if (S.game) await loadGame();
   }
@@ -37,15 +53,23 @@ async function loadGame() {
     sb.from('roles').select('*').eq('game_id', g),
     sb.from('events').select('*').eq('game_id', g).order('opens_at'),
     sb.from('event_results').select('*').eq('game_id', g)]);
+  // A failed request must not look like an empty game ("Nothing has happened yet"); keep what we had and say so.
+  const failed = [pl, ro, ev, re].find(r => r.error);
+  if (failed) throw failed.error;
   S.players = pl.data ?? [];
   S.roles = Object.fromEntries((ro.data ?? []).map(r => [r.player_id, r.role]));
   S.events = ev.data ?? [];
   S.results = Object.fromEntries((re.data ?? []).map(r => [r.event_id, { target: r.target_id, kind: r.kind, accepted: r.accepted, votes: r.votes }]));
   S.me = S.players.find(p => p.user_id === S.user.id) ?? null;
-  S.mine = {}; S.endChoice = {}; S.picks = {}; S.messages = []; S.offer = null;
+  S.mine = {}; S.endChoice = {}; S.picks = {}; S.messages = []; S.offer = null; S.recruits = {}; S.locks = {};
   if (S.me && S.roles[S.me.id] === 'traitor') {
-    const { data } = await sb.from('messages').select('*').eq('game_id', g).order('created_at').limit(200);
-    S.messages = data ?? [];
+    // Newest 200, then back into reading order (the oldest 200 would freeze the chat once it got long).
+    const { data } = await sb.from('messages').select('*').eq('game_id', g).order('created_at', { ascending: false }).limit(200);
+    S.messages = (data ?? []).reverse();
+    const rc = await sb.from('recruit_offers').select('*').eq('game_id', g);
+    S.recruits = Object.fromEntries((rc.data ?? []).map(r => [r.event_id, { target: r.target_id, accepted: r.accepted }]));
+    const lk = await sb.from('murder_locks').select('*').eq('game_id', g);
+    S.locks = Object.fromEntries((lk.data ?? []).map(l => [l.event_id, { kind: l.kind, target: l.target_id }]));
   }
   for (const e of S.events.filter(isOpen)) {
     if (!S.me) break;
@@ -64,6 +88,24 @@ async function loadGame() {
     }
   }
 }
+
+// Raw database and auth messages are written for developers; the ones people can actually hit get plain words.
+// Anything not listed is shown as it came.
+const FRIENDLY = [
+  [/people_display_name_unique|display_name.*already exists/i, 'That name is already taken. Please choose a different one.'],
+  [/people_email_key|people.*email.*already exists|already registered/i, 'That email is already registered. Sign in instead.'],
+  [/people_name_ok/i, 'Names must be 1 to 40 characters, with no line breaks.'],
+  [/event not open/i, 'That choice has closed or already been locked in.'],
+  [/recruitment not available/i, 'You can only recruit when two or fewer traitors are left.'],
+  [/invalid target/i, 'You cannot choose that player.'],
+  [/not allowed/i, 'You are not allowed to do that.'],
+  [/no offer/i, 'There is no offer to answer any more.'],
+  [/invalid login credentials/i, 'That email and password do not match.'],
+  [/jwt expired|invalid jwt/i, 'Your sign-in has expired. Please sign in again.'],
+  [/failed to fetch|networkerror|load failed/i, 'Could not reach the server. Check your connection and try again.'],
+  [/duplicate key value|violates (unique|foreign key|check) constraint/i, 'That could not be saved. Please check what you entered and try again.'],
+];
+const friendly = m => FRIENDLY.find(([re]) => re.test(m))?.[1] ?? m;
 
 async function call(fn, args) {
   const { error } = await sb.rpc(fn, args);
@@ -177,9 +219,8 @@ function playerGrid() {
   }).join('')}</div>`;
 }
 
-function options(list, blank, required) {
-  return `<option value=""${required ? ' disabled selected' : ''}>${blank}</option>` + list.map(p => `<option value="${esc(p.id)}">${esc(p.display_name)}</option>`).join('');
-}
+// The traitors have until picks_close_at to agree; windows saved before that was added just use the close.
+const traitorClock = e => `<p class="clock">${countdown(e.picks_close_at ?? e.closes_at)}<small>to agree</small></p>`;
 
 function eventPanel(e) {
   const me = S.me, murder = e.kind === 'murder';
@@ -212,13 +253,21 @@ function eventPanel(e) {
   const canRecruit = traitorsLeft <= 2;
   const picked = mine?.target && S.players.find(p => p.id === mine.target);
   const team = (S.picks[e.id] ?? []).map(k => `${esc(name(k.player_id))} → ${esc(k.target_id ? `${k.kind === 'recruit' ? 'recruit ' : ''}${name(k.target_id)}` : 'nobody')}`).join(', ');
+  const lock = S.locks[e.id];
+  if (lock) {
+    const t = lock.target && S.players.find(p => p.id === lock.target);
+    const what = !t ? '<div class="voted"><b class="bigname">Nobody</b></div>'
+      : `<div class="voted"><span class="muted">${lock.kind === 'recruit' ? 'Recruited' : 'Murder'}</span><span class="voteface">${avatar(t)}<b class="bigname">${esc(t.display_name)}</b></span></div>`;
+    return `<div class="slip murder"><h3>The traitors have decided</h3>${what}
+      <p class="muted choice">${lock.kind === 'recruit' && t ? 'They are a traitor now and can refuse until the window closes. If they do, they are murdered.' : t ? 'The murder is revealed with the next results.' : 'Nobody was chosen, so nobody will be murdered.'}</p></div>`;
+  }
   const body = !mine ? '<p>You haven\'t chosen yet.</p>'
-    : picked ? `<div class="voted"><span class="muted">${mine.kind === 'recruit' ? 'You will recruit' : 'You will murder'}</span><span class="voteface">${avatar(picked)}<b class="bigname">${esc(picked.display_name)}</b></span></div>`
-    : '<div class="voted"><span class="muted">Your pick</span><b class="bigname">No murder</b></div>';
-  return `<div class="slip murder"><h3>${canRecruit ? 'Murder or recruit' : 'Choose a victim'}</h3>${clock}
-    ${canRecruit ? `<p class="muted">Only ${traitorsLeft} traitor${traitorsLeft === 1 ? '' : 's'} left. You can recruit a faithful instead of murdering. They can refuse, and then nothing happens.</p>` : ''}
-    ${body}<div class="row"><button ${mine ? 'class="ghost"' : ''} data-act="votescreen" data-ev="${esc(e.id)}">${mine ? 'Change pick' : 'Choose'}</button></div>
-    ${team ? `<p class="muted choice">Traitor picks: ${team}</p>` : ''}</div>`;
+    : picked ? `<div class="voted"><span class="muted">${mine.kind === 'recruit' ? 'You suggest recruiting' : 'You suggest murdering'}</span><span class="voteface">${avatar(picked)}<b class="bigname">${esc(picked.display_name)}</b></span></div>`
+    : '<div class="voted"><span class="muted">Your pick</span><b class="bigname">Nobody</b></div>';
+  return `<div class="slip murder"><h3>${canRecruit ? 'Murder or recruit' : 'Choose a victim'}</h3>${traitorClock(e)}
+    <p class="muted">${canRecruit ? `Only ${traitorsLeft} traitor${traitorsLeft === 1 ? '' : 's'} left, so you can recruit a faithful instead of murdering. A recruit becomes a traitor at once, but can refuse, and then they are murdered. ` : ''}Each traitor suggests someone. When more than half of you name the same person, it is locked in. At the deadline, one of the suggestions is chosen at random.</p>
+    ${body}<div class="row"><button ${mine ? 'class="ghost"' : ''} data-act="votescreen" data-ev="${esc(e.id)}">${mine ? 'Change suggestion' : 'Suggest'}</button></div>
+    ${team ? `<p class="muted choice">Suggestions: ${team}</p>` : ''}</div>`;
 }
 
 // Full-screen vote: clock and Cast vote stay at the top, the choice is a ring round a photo, and nothing is sent until Cast vote.
@@ -243,15 +292,15 @@ function murderView(e) {
   const canRecruit = S.players.filter(p => p.alive && S.roles[p.id] === 'traitor').length <= 2;
   const picked = targets.find(p => p.id === sel);
   const verb = kind === 'recruit' ? 'Recruit' : 'Murder';
-  const clock = `<p class="clock">${countdown(e.closes_at)}<small>left to decide</small></p>`;
+  const clock = traitorClock(e);
   const tiles = targets.map(p => `<label class="tile"><input type="radio" name="vote" value="${esc(p.id)}" ${p.id === sel ? 'checked' : ''}>
     <span class="face">${avatar(p)}</span><span class="pname">${esc(p.display_name)}</span></label>`).join('');
   const mode = (k, label) => `<button class="ghost ${kind === k ? 'active' : ''}" data-act="votekind" data-kind="${k}">${label}</button>`;
   return `<div class="votebar"><h2>${canRecruit ? 'Murder or recruit' : 'Choose a victim'}</h2>${clock}
     ${canRecruit ? `<div class="seg" style="margin:0 0 12px">${mode('kill', 'Murder')}${mode('recruit', 'Recruit')}</div>` : ''}
-    <div class="row"><button data-act="cast" data-ev="${esc(e.id)}" ${picked ? '' : 'disabled'}>${picked ? `${canRecruit ? verb + ' ' : 'Murder '}${esc(picked.display_name)}` : 'Confirm'}</button>
+    <div class="row"><button data-act="cast" data-ev="${esc(e.id)}" ${picked ? '' : 'disabled'}>${picked ? `${canRecruit ? verb + ' ' : 'Murder '}${esc(picked.display_name)}` : 'Suggest'}</button>
     <button class="ghost" data-act="voteback">Back</button></div>
-    ${kind === 'recruit' && canRecruit ? '<p class="muted choice">They can refuse, and then nothing happens.</p>' : ''}</div>
+    ${kind === 'recruit' && canRecruit ? '<p class="muted choice">They become a traitor at once, but can refuse, and then they are murdered.</p>' : ''}</div>
     <div class="tiles">${tiles}</div>`;
 }
 
@@ -276,18 +325,18 @@ function revealPanel() {
 function offerCard() {
   const e = S.events.find(x => x.id === S.offer);
   return `<div class="slip murder"><h3>The traitors have chosen you</h3>
-    <p>Join them and you become a traitor. Refuse and nothing happens. No one else will know either way.</p>
-    <p class="clock">${e ? countdown(e.reveals_at) : ''}<small>to answer</small></p>
-    <div class="row"><button data-act="accept" data-ev="${esc(S.offer)}">Join the traitors</button>
-    <button class="ghost" data-act="refuse" data-ev="${esc(S.offer)}">Refuse</button></div></div>`;
+    <p>You are a traitor now. Refuse and you will be murdered. If you do nothing you stay a traitor, and nobody else will know either way.</p>
+    <p class="clock">${e ? countdown(e.closes_at) : ''}<small>left to refuse</small></p>
+    <div class="row"><button class="ghost" data-act="refuse" data-ev="${esc(S.offer)}">Refuse and be murdered</button></div></div>`;
 }
 
 function resultItem(e) {
   const r = S.results[e.id], verb = e.kind === 'banishment' ? 'banished' : 'murdered';
   if (e.kind === 'endgame') return `<li class="banishment">${r?.accepted ? 'Everyone chose to end the game.' : 'Not everyone chose to end the game, so it goes on.'}</li>`;
-  // Only traitors can read a recruit result; everyone else sees an ordinary quiet round.
-  if (r?.kind === 'recruit') {
-    return `<li class="${esc(e.kind)}"><b>${esc(name(r.target))}</b> ${r.accepted ? 'accepted and joined the traitors.' : 'refused. Nobody was murdered.'}</li>`;
+  // Only traitors can read the recruit offer; everyone else just sees an ordinary quiet round.
+  const rc = S.recruits[e.id];
+  if (rc) {
+    return `<li class="${esc(e.kind)}"><b>${esc(name(rc.target))}</b> ${rc.accepted === false ? 'refused to join and was murdered.' : 'was recruited and joined the traitors.'}</li>`;
   }
   const t = r?.target;
   // The saved text is the same breakdown Slack gets: a "Votes:" line, then one line per target, then notes.
@@ -442,7 +491,7 @@ function curtain() {
   const picks = sec.picks.map(k => k.event_kind === 'endgame'
     ? `<p>End game: <b>${esc(k.who)}</b> → ${k.end_vote === true ? 'end the game' : k.end_vote === false ? 'keep playing' : 'answered'}</p>`
     : `<p>${k.event_kind === 'banishment' ? 'Vote' : 'Traitor pick'}: <b>${esc(k.who)}</b> → ${esc(k.target ? `${k.kind === 'recruit' ? 'recruit ' : ''}${k.target}` : 'nobody')}</p>`).join('');
-  const offers = sec.offers.map(o => `<p>Recruit offer to <b>${esc(o.target)}</b>: ${o.accepted === null ? 'waiting for an answer' : o.accepted ? 'accepted' : 'refused'}</p>`).join('');
+  const offers = sec.offers.map(o => `<p>Recruit offer to <b>${esc(o.target)}</b>: ${o.accepted === false ? 'refused and is murdered' : 'recruited, can refuse until the window closes'}</p>`).join('');
   const chat = S.gmchat.map(m => `<p><b>${esc(m.who)}</b>: ${esc(m.body)}</p>`).join('') || '<p class="muted">No messages yet.</p>';
   return `<div class="card"><h3>Behind the curtain</h3>
     <div class="dash-item"><b>Players and roles</b>${players}</div>
@@ -479,7 +528,7 @@ function view() {
       ? `<div class="form"><input id="email" type="email" placeholder="Email" autocomplete="username">
          <input id="pw" type="password" placeholder="Password" autocomplete="current-password"><button data-act="login">Sign in</button>
          <a href="#" data-act="forgot">Forgot your password?</a></div>`
-      : `<div class="form"><input id="rname" placeholder="Your name"><input id="remail" type="email" placeholder="Work email" autocomplete="username">
+      : `<div class="form"><input id="rname" placeholder="Your name" maxlength="40"><input id="remail" type="email" placeholder="Work email" autocomplete="username">
          <input id="rpw" type="password" placeholder="Choose a password (8+ characters)" autocomplete="new-password">
          <input id="rpw2" type="password" placeholder="Confirm password" autocomplete="new-password">
          <input id="rcode" placeholder="Signup code"><button data-act="register">Register</button></div>`;
@@ -522,7 +571,7 @@ function render() {
   app.querySelectorAll('select,input').forEach(e => { keep[e.id] = e.value; });
   const focus = document.activeElement?.id;
   const header = S.user ? `<div class="bar"><span class="who"><span class="muted">${S.person ? `<b class="uname">${esc(S.person.name)}</b> ` : ''}${esc(S.user.email)}</span>${S.person && !S.admin && (S.person.avatar_key || S.skipPhoto) && !S.picking ? `<a href="#" data-act="changephoto">Edit</a>` : ''}<button class="ghost" data-act="logout">Sign out</button></span></div>` : '';
-  app.innerHTML = header + (S.error ? `<div class="error">${esc(S.error)}</div>` : '')
+  app.innerHTML = header + (S.error ? `<div class="error">${esc(friendly(S.error))}</div>` : '')
     + (S.notice ? `<div class="notice">${esc(S.notice)}</div>` : '') + view()
     + (S.user ? `<footer class="site-foot"><img src="assets/dev-x-traitors.svg" alt="DEV x Traitors" width="233" height="60"></footer>` : '');
   for (const [id, v] of Object.entries(keep)) { const e = document.getElementById(id); if (e && id) e.value = v; }
@@ -691,13 +740,10 @@ const actions = {
     await call(murder ? (S.voteKind === 'recruit' && target ? 'pick_recruit' : 'pick_victim') : 'cast_vote', { p_event: el.dataset.ev, p_target: target });
     if (!S.error) { S.voting = null; render(); }
   },
-  accept: async el => {
-    await call('respond_recruit', { p_event: el.dataset.ev, p_accept: true });
-    if (!S.error) { S.notice = 'You will become a traitor when the round is revealed.'; render(); }
-  },
   refuse: async el => {
+    if (!confirm('Refuse to join the traitors? You will be murdered when the results are revealed.')) return;
     await call('respond_recruit', { p_event: el.dataset.ev, p_accept: false });
-    if (!S.error) { S.notice = 'You refused. Nothing happens.'; render(); }
+    if (!S.error) { S.notice = 'You refused. You will be murdered when the results are revealed.'; render(); }
   },
   endgame: el => call('cast_endgame', { p_event: el.dataset.ev, p_end: el.dataset.end === 'true' }),
   revealme: () => call('reveal_my_role', { p_game: S.game.id }),
@@ -754,6 +800,5 @@ document.addEventListener('keydown', e => {
 
 sb.auth.onAuthStateChange(event => { if (event === 'PASSWORD_RECOVERY') S.recovery = true; setTimeout(refresh, 0); });
 
-// An open <select> is closed by a re-render, so don't poll over someone mid-choice.
-setInterval(() => { if (document.activeElement?.tagName !== 'SELECT') refresh(); }, 10000);
+setInterval(refresh, 10000);
 setInterval(tick, 1000);

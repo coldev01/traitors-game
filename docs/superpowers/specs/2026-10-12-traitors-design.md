@@ -64,9 +64,9 @@ Banishment and murder are two interleaved tracks, not a single day/night sequenc
 
 - **Fixed times only.** Events resolve at their scheduled time. There is no early finish, so Slack discussion can run until the deadline and nobody is pressured.
 - **Banishment:** most votes is banished. Ties are broken at random among the tied players. Not voting counts as abstaining. Once the result is announced, who voted for whom is published too, in Slack and in the app's "What happened" timeline (the same saved text, so they always match) (only the votes that counted, plus who did not vote, and a note when a tie was broken at random). Skipped rounds publish nothing. The banished player is marked dead and their role is revealed at `reveals_at`.
-- **Murder:** the traitors must choose a victim (or recruit); there is no "no murder" option in the app. They vote among themselves; majority wins, ties random. If the window closes with no pick at all, nobody dies, because the game can't force a choice.
+- **Murder:** the traitors must choose a victim (or recruit); there is no "no murder" option in the app. Each living traitor suggests a target. As soon as more than half of them name the same person (and the same choice of murder or recruit) it is locked in. The traitors have until 14:00 on the day the window opens; at that deadline the most-suggested choice goes ahead, a tie is settled at random, and no suggestions at all means nobody dies. Nothing the traitors choose is stored where the faithful can read it (`murder_locks` is traitor-only).
 - **Murder timing:** the victim is chosen at close but only applied (marked dead, role revealed) at `reveals_at`, so the reveal always lands before that day's banishment. A victim who voted before being applied has that vote discarded.
-- **Recruitment:** once 2 or fewer traitors are alive, a traitor's murder pick can instead be a recruit pick (majority across traitors, ties random, same as a murder). At the close the chosen faithful gets a private offer, open until the reveal. Accept: they become a traitor at the reveal (role card, traitors chat and traitor view update). Refuse, or no answer: nothing happens and nobody dies that round. Recruit results are visible to traitors only; everyone else sees an ordinary "nobody was murdered" round.
+- **Recruitment:** once 2 or fewer traitors are alive, a suggestion can be a recruit instead of a murder (same majority and deadline rules). When a recruit is locked in the target becomes a traitor at once (role card, traitors chat and traitor view update) and sees a private offer. They can refuse until the murder window closes; refusing turns them faithful again and they are murdered when the window is revealed, shown as faithful. No answer: they stay a traitor and nobody dies. Everyone else sees an ordinary "nobody was murdered" round, unless the recruit refused, which looks like any murder.
 - **Win check** after each applied result: faithful win when all traitors are out; traitors win when they equal or outnumber the faithful.
 
 ## End game
@@ -95,7 +95,7 @@ Banishment and murder are two interleaved tracks, not a single day/night sequenc
 - The anon key ships in the web build by design, so security rests entirely on RLS and server-side functions. Roles and actions are never readable by the wrong player; chat posting is validated server-side.
 - Sign-up is restricted to the org Google domain.
 - The Supabase owner can read all data (fairness, not a technical risk). Chat has a length cap and a rate limit, and message text is escaped (no BBCode) in Godot.
-- Messages and player data are deleted after a game ends.
+- Nothing is deleted automatically. A finished game is archived and kept (votes, results, chat and roles) until the GM deletes it with Delete game, which removes everything in it. Decide on a retention period before the first real game.
 - Supabase free-tier projects pause after a week of inactivity, which could affect a game left idle.
 
 ## Testing
