@@ -221,17 +221,27 @@ create policy messages_select on messages for select to authenticated using (is_
 
 create or replace function am_admin() returns boolean language sql stable as $$ select is_admin() $$;
 
--- Offsets are minutes from Monday 00:00 local time. In a murder window the traitors must decide by 'lock' (14:00 on the
--- day it opens); a recruit then has until the window closes to refuse. Murder 1 closes Wed 00:00 and murder 2 closes
--- Mon 00:00 (the next week); nothing opens or closes on a Friday, Saturday or Sunday.
+-- Offsets are minutes of WORKING time from the start day's 00:00 (see work_time): a day is 1440 minutes, and Friday to Sunday
+-- do not count, so a round is 4 working days = 5760 minutes. In a murder window the traitors must decide by 'lock' (14:00 on
+-- the day it opens); a recruit then has until the window closes to refuse. Murder 1 closes at the start of day 3 and murder 2
+-- at the start of the next round; nothing opens, closes or locks on a Friday, Saturday or Sunday.
+-- Turns working-time minutes after p_anchor into a local timestamp, skipping Fri-Sun. The anchor must be on Mon-Thu (callers
+-- move it); day 0 is the anchor's day, the next day after a Thursday is the following Monday.
+create or replace function work_time(p_anchor timestamp, p_off int) returns timestamp language sql immutable as $$
+  select p_anchor + make_interval(
+    days => (((extract(isodow from p_anchor)::int - 1) + p_off / 1440) / 4) * 7
+          + (((extract(isodow from p_anchor)::int - 1) + p_off / 1440) % 4) - (extract(isodow from p_anchor)::int - 1),
+    mins => p_off % 1440)
+$$;
+
 create or replace function default_schedule() returns jsonb language sql immutable as $$
   -- Votes open and close Mon-Thu 09:00; murders close at midnight and are revealed at 09:00. Never Fri-Sun (the team is off
-  -- alternate Fridays). Murder 2 spans the weekend.
+  -- alternate Fridays). Started on a Monday, murder 2 spans the weekend.
   select jsonb_build_array(
     jsonb_build_object('kind', 'banishment', 'open', 540,  'close', 1980, 'reveal', 1980),
     jsonb_build_object('kind', 'murder',     'open', 1980, 'close', 2880, 'reveal', 3420, 'lock', 2280),
     jsonb_build_object('kind', 'banishment', 'open', 3420, 'close', 4860, 'reveal', 4860),
-    jsonb_build_object('kind', 'murder',     'open', 4860, 'close', 10080, 'reveal', 10620, 'lock', 5160))
+    jsonb_build_object('kind', 'murder',     'open', 4860, 'close', 5760, 'reveal', 6300, 'lock', 5160))
 $$;
 
 create or replace function create_game() returns uuid language plpgsql security definer set search_path = public as $$
@@ -249,7 +259,7 @@ end $$;
 
 create or replace function internal_start_game(
   p_game uuid, p_anchor timestamp default null, p_schedule jsonb default null,
-  p_weeks int default 12, p_period int default 10080
+  p_weeks int default 12, p_period int default 5760
 ) returns void language plpgsql security definer set search_path = public as $$
 declare g games; n int; k int; v_anchor timestamp;
 begin
@@ -275,14 +285,17 @@ begin
     from (select id, row_number() over (order by random()) rn from players where game_id = p_game) s;
   end if;
 
-  v_anchor := coalesce(p_anchor, date_trunc('week', now() at time zone g.tz) + interval '7 days');
+  -- With no date the game starts tomorrow at 00:00 (first banishment 09:00), or the next Monday if tomorrow is Fri-Sun.
+  -- A given date that falls on Fri-Sun moves to the next Monday so day 0 is always a working day.
+  v_anchor := coalesce(p_anchor, date_trunc('day', now() at time zone g.tz) + interval '1 day');
+  if extract(isodow from v_anchor) > 4 then v_anchor := v_anchor + make_interval(days => 8 - extract(isodow from v_anchor)::int); end if;
   -- ponytail: events are pre-generated for p_weeks (12); a game longer than that needs a top-up function.
   insert into events (game_id, kind, opens_at, closes_at, reveals_at, picks_close_at)
   select p_game, s ->> 'kind',
-    (v_anchor + make_interval(mins => w * p_period + (s ->> 'open')::int)) at time zone g.tz,
-    (v_anchor + make_interval(mins => w * p_period + (s ->> 'close')::int)) at time zone g.tz,
-    (v_anchor + make_interval(mins => w * p_period + (s ->> 'reveal')::int)) at time zone g.tz,
-    (v_anchor + make_interval(mins => w * p_period + (s ->> 'lock')::int)) at time zone g.tz
+    work_time(v_anchor, w * p_period + (s ->> 'open')::int) at time zone g.tz,
+    work_time(v_anchor, w * p_period + (s ->> 'close')::int) at time zone g.tz,
+    work_time(v_anchor, w * p_period + (s ->> 'reveal')::int) at time zone g.tz,
+    work_time(v_anchor, w * p_period + (s ->> 'lock')::int) at time zone g.tz
   from generate_series(0, p_weeks - 1) w, jsonb_array_elements(coalesce(p_schedule, default_schedule())) s;
 
   update games set status = 'active' where id = p_game;
@@ -290,7 +303,7 @@ end $$;
 
 create or replace function start_game(
   p_game uuid, p_anchor timestamp default null, p_schedule jsonb default null,
-  p_weeks int default 12, p_period int default 10080
+  p_weeks int default 12, p_period int default 5760
 ) returns void language plpgsql security definer set search_path = public as $$
 begin
   if not is_admin() then raise exception 'admin only'; end if;
@@ -803,6 +816,20 @@ begin
   where id = p_event and status in ('scheduled', 'open');
 end $$;
 
+-- Gives the traitors longer to decide without moving when the window closes or the result shows. Capped at the close, since
+-- picks stop then anyway, and refused once a choice has locked (extending then would change nothing).
+create or replace function gm_extend_picks(p_event uuid, p_by interval default '6 hours') returns void language plpgsql security definer set search_path = public as $$
+declare n int;
+begin
+  if not is_admin() then raise exception 'admin only'; end if;
+  perform pg_advisory_xact_lock(727001);
+  update events set picks_close_at = least(coalesce(picks_close_at, closes_at) + p_by, closes_at)
+  where id = p_event and kind = 'murder' and status = 'open'
+    and not exists (select 1 from murder_locks where event_id = p_event);
+  get diagnostics n = row_count;
+  if n = 0 then raise exception 'The traitors have already locked their choice, or the window is closed.'; end if;
+end $$;
+
 -- Retention: spec says player data is deleted after a game ends.
 -- A finished game can be put away so the app moves on to a fresh one; it stays in the database and in the GM's archive list.
 create or replace function gm_archive_game(p_game uuid) returns void language plpgsql security definer set search_path = public as $$
@@ -856,7 +883,7 @@ revoke execute on function
   am_admin(), default_schedule(), create_game(),
   start_game(uuid, timestamp, jsonb, int, int), cast_vote(uuid, uuid), pick_victim(uuid, uuid),
   post_message(uuid, text), pick_recruit(uuid, uuid), my_pick(uuid), team_picks(uuid), my_offer(uuid), respond_recruit(uuid, boolean),
-  gm_force_close(uuid), gm_extend_event(uuid, interval), gm_delete_game(uuid),
+  gm_force_close(uuid), gm_extend_event(uuid, interval), gm_extend_picks(uuid, interval), gm_delete_game(uuid),
   is_admin(), my_player(uuid), in_game(uuid), is_traitor(uuid)
   from public, anon;
 
@@ -865,7 +892,7 @@ grant execute on function
   am_admin(), default_schedule(), create_game(),
   start_game(uuid, timestamp, jsonb, int, int), cast_vote(uuid, uuid), pick_victim(uuid, uuid),
   post_message(uuid, text), pick_recruit(uuid, uuid), my_pick(uuid), team_picks(uuid), my_offer(uuid), respond_recruit(uuid, boolean),
-  gm_force_close(uuid), gm_extend_event(uuid, interval), gm_delete_game(uuid),
+  gm_force_close(uuid), gm_extend_event(uuid, interval), gm_extend_picks(uuid, interval), gm_delete_game(uuid),
   is_admin(), my_player(uuid), in_game(uuid), is_traitor(uuid)
   to authenticated;
 
@@ -1017,6 +1044,7 @@ begin
       select jsonb_build_object(
         'id', e.id, 'kind', e.kind, 'status', e.status, 'untimed', e.untimed,
         'opens_at', e.opens_at, 'closes_at', e.closes_at, 'reveals_at', e.reveals_at,
+        'picks_close_at', e.picks_close_at, 'locked', exists (select 1 from murder_locks l where l.event_id = e.id),
         'voters', case when e.kind <> 'murder' then (select count(*) from players p where p.game_id = e.game_id and p.alive) end,
         'voted', case when e.kind <> 'murder' then
           (select count(*) from actions a join players p on p.id = a.player_id where a.event_id = e.id and p.alive) end,

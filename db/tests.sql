@@ -244,6 +244,38 @@ select tests.throws(format($$select gm_set_player(%L, %L, false)$$, tests.g(), t
 select tests.reset();
 rollback to savepoint s2;
 
+-------------------------------------------------------------------- 2a. working-day schedule: any start day, nothing on Fri-Sun
+select tests.eq(work_time('2026-10-19', 5760), '2026-10-26'::timestamp, 'a Monday start: round 2 begins the next Monday');
+select tests.eq(work_time('2026-10-21', 1980), '2026-10-22 09:00'::timestamp, 'a Wednesday start: day 1 is Thursday');
+select tests.eq(work_time('2026-10-21', 2880), '2026-10-26'::timestamp, 'a Wednesday start: day 2 skips the weekend to Monday');
+select tests.eq(work_time('2026-10-21', 5760), '2026-10-28'::timestamp, 'a Wednesday start: a round is four working days');
+select tests.eq((select count(*) from generate_series(0, 3) d, generate_series(0, 12 * 5760, 60) o
+                 where extract(isodow from work_time('2026-10-19'::timestamp + d * interval '1 day', o)) > 4), 0::bigint, 'never lands on Fri-Sun');
+savepoint s2a;
+insert into admins values ('gm@org.test');
+select tests.make_user('gm');
+select tests.add_people(6);
+select tests.act_as('gm');
+select set_config('t.g', create_game()::text, false);
+select tests.lives(format($$select gm_set_player(%L, %L, true)$$, tests.g(), tests.uid('p' || i)), 'select p' || i) from generate_series(1, 6) i;
+select start_game(tests.g(), '2026-10-23');
+select tests.reset();
+select tests.eq((select opens_at from events where game_id = tests.g() and kind = 'banishment' order by opens_at limit 1),
+                '2026-10-26 09:00:00+00'::timestamptz, 'a Friday start waits for Monday (clocks went back on the 25th)');
+rollback to savepoint s2a;
+savepoint s2a2;
+insert into admins values ('gm@org.test');
+select tests.make_user('gm');
+select tests.add_people(6);
+select tests.act_as('gm');
+select set_config('t.g', create_game()::text, false);
+select tests.lives(format($$select gm_set_player(%L, %L, true)$$, tests.g(), tests.uid('p' || i)), 'select p' || i) from generate_series(1, 6) i;
+select start_game(tests.g());
+select tests.reset();
+select tests.ok((select opens_at > now() and extract(isodow from opens_at at time zone 'Europe/London') <= 4 and extract(hour from opens_at at time zone 'Europe/London') = 9
+                 from events where game_id = tests.g() and kind = 'banishment' order by opens_at limit 1), 'no date: starts at 09:00 on a working day, in the future');
+rollback to savepoint s2a2;
+
 -------------------------------------------------------------------- 2b. no upper limit on players
 savepoint s2b;
 insert into admins values ('gm@org.test');
@@ -510,6 +542,32 @@ select advance_games(now() + interval '10 hours 30 minutes');
 select advance_games(now() + interval '11 hours 5 minutes');
 select tests.ok((select target_id is null and kind = 'kill' from murder_locks where event_id = '00000000-0000-0000-0000-0000000000d5'), 'no picks at the deadline locks nobody');
 rollback to savepoint s6c;
+
+-------------------------------------------------------------------- 6c2. the GM can give the traitors longer to decide
+savepoint s6c2;
+select set_config('t.g', tests.make_game(8)::text, false);
+select tests.set_traitors(tests.g(), '{a,b}');
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status, picks_close_at) values
+  ('00000000-0000-0000-0000-0000000000e1', tests.g(), 'murder', now() - interval '1 hour', now() + interval '10 hours', now() + interval '15 hours', 'open', now() + interval '1 hour');
+select tests.act_as('a');
+select tests.throws($$select gm_extend_picks('00000000-0000-0000-0000-0000000000e1')$$, 'admin only', 'non-admin cannot extend the deadline');
+select tests.act_as('gm');
+select gm_extend_picks('00000000-0000-0000-0000-0000000000e1');
+select tests.reset();
+select tests.ok((select picks_close_at between now() + interval '6 hours 59 minutes' and now() + interval '7 hours 1 minute' and closes_at > now() + interval '9 hours 59 minutes'
+                 from events where id = '00000000-0000-0000-0000-0000000000e1'), 'six hours more to decide; the close and reveal do not move');
+select tests.act_as('gm');
+select gm_extend_picks('00000000-0000-0000-0000-0000000000e1');
+select tests.reset();
+select tests.ok((select picks_close_at = closes_at from events where id = '00000000-0000-0000-0000-0000000000e1'), 'the deadline never goes past the close');
+select tests.act_as('a');
+select pick_victim('00000000-0000-0000-0000-0000000000e1', tests.pid(tests.g(), 'd'));
+select tests.act_as('b');
+select pick_victim('00000000-0000-0000-0000-0000000000e1', tests.pid(tests.g(), 'd'));
+select tests.act_as('gm');
+select tests.throws($$select gm_extend_picks('00000000-0000-0000-0000-0000000000e1')$$, 'already locked', 'cannot extend once the choice is locked');
+select tests.reset();
+rollback to savepoint s6c2;
 
 -------------------------------------------------------------------- 6d. limits, and majorities with more traitors
 savepoint s6d;

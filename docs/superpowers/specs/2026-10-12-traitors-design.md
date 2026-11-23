@@ -49,6 +49,8 @@ An asynchronous Traitors-style social deduction game for the org, played over we
 
 ## Schedule (Europe/London)
 
+A round is four working days (Mon to Thu); Fri to Sun are skipped. The game can start on any working day and the table below is day 1 to day 4 of a round, shown for a Monday start. Pressing Start with no date begins tomorrow, or the next Monday if tomorrow is Fri to Sun.
+
 | Event | Opens | Closes | Result shown |
 |---|---|---|---|
 | Banishment 1 | Mon 09:00 | Tue 09:00 | Tue 09:00 |
@@ -56,7 +58,7 @@ An asynchronous Traitors-style social deduction game for the org, played over we
 | Banishment 2 | Wed 09:00 | Thu 09:00 | Thu 09:00 |
 | Murder 2 | Thu 09:00 | Mon 09:00 | Mon 09:00 |
 
-Repeats weekly: two rounds a week, so a 10-player game runs roughly 2–3 weeks. Times live in game config, not code, so the schedule can change (or compress to minutes for dry runs) without code changes.
+Repeats every four working days: two rounds a week, so a 10-player game runs roughly 2–3 weeks. Times live in game config, not code, so the schedule can change (or compress to minutes for dry runs) without code changes.
 
 Banishment and murder are two interleaved tracks, not a single day/night sequence. Windows overlap (Wed: banishment 2 and murder 1; Mon: banishment 1 and murder 2).
 
@@ -113,6 +115,6 @@ Banishment and murder are two interleaved tracks, not a single day/night sequenc
 ## Assumptions to confirm
 
 - Nothing opens, closes or posts on Fri to Sun (the team is off alternate Fridays). Every event starts at 09:00 Mon to Thu.
-- Murder 2's window (Thu 09:00 to Mon 09:00) deliberately spans the weekend.
+- Murder 2's window (day 4 09:00 to the next day 1 09:00, so Thu to Mon on a Monday start) deliberately spans the weekend.
 - The org supplies headshots and an `email → photo` mapping.
 - **Reveal stage:** when everyone picks End, or 2 players are left, nothing is announced yet. The game enters a reveal stage: nothing is open or scheduled, and each player still standing presses "Reveal my role" (the GM can reveal anyone, or everyone). Each reveal is shown to everyone and posted to Slack. After the last reveal the winner is announced: the Traitors if any revealed role is a traitor, otherwise the Faithful.

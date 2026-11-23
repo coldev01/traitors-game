@@ -445,6 +445,7 @@ function dashboard() {
   const controls = e => `<div class="row"><button class="ghost" data-act="close" data-ev="${esc(e.id)}">Close now</button>
     ${e.untimed ? '' : `<button class="ghost" data-act="extend" data-ev="${esc(e.id)}" data-by="6 hours">Add 6 hours</button>
     <button class="ghost" data-act="extend" data-ev="${esc(e.id)}" data-by="1 day">Add a day</button>`}
+    ${e.kind === 'murder' && !e.locked && !e.untimed ? `<button class="ghost" data-act="extendpicks" data-ev="${esc(e.id)}">Give traitors 6 more hours</button>` : ''}
     ${e.kind === 'banishment' ? `<button class="ghost" data-act="remind" data-ev="${esc(e.id)}">Nudge on Slack</button>` : ''}
     ${e.kind === 'endgame' ? '' : `<button class="ghost" data-act="skip" data-ev="${esc(e.id)}">Skip, no result</button>`}</div>`;
   let nextShown = false;
@@ -465,7 +466,7 @@ function dashboard() {
       ? (e.not_voted.length ? `<p class="muted">Still to vote: ${e.not_voted.map(esc).join(', ')}</p>` : '<p class="muted">Everyone has voted.</p>')
       : '';
     return `<div class="dash-item"><b>${label(e)}</b>
-      <p class="muted">${done} of ${total} ${vote ? 'have voted' : 'traitors have chosen'}. ${e.untimed ? 'No deadline: it closes when everyone has answered.' : `Closes in ${countdown(e.closes_at)}`}</p>
+      <p class="muted">${done} of ${total} ${vote ? 'have voted' : 'traitors have chosen'}. ${e.untimed ? 'No deadline: it closes when everyone has answered.' : `Closes in ${countdown(e.closes_at)}`}${e.kind === 'murder' ? (e.locked ? ' The traitors have locked their choice.' : e.picks_close_at && new Date(e.picks_close_at) > new Date() ? ` The traitors decide within ${countdown(e.picks_close_at)}.` : '') : ''}</p>
       <div class="meter"><i style="width:${pct}%"></i></div>${who}${controls(e)}</div>`;
   }).join('');
   const turnout = d.history.length ? `<p class="muted">Recent votes, newest first: ${d.history.map(h => `${h.voted} voted`).join(', ')}</p>` : '';
@@ -753,6 +754,7 @@ const actions = {
   gmrevealall: () => confirm('Reveal every remaining role now?') && call('gm_reveal_all', { p_game: S.game.id }),
   startend: () => confirm('Start the end game now? Anything open is voided and the final banishment begins.') && call('gm_start_endgame', { p_game: S.game.id }),
   close: el => call('gm_force_close', { p_event: el.dataset.ev }),
+  extendpicks: el => call('gm_extend_picks', { p_event: el.dataset.ev }),
   extend: el => call('gm_extend_event', { p_event: el.dataset.ev, p_by: el.dataset.by || '1 day' }),
   archiveopen: async el => {
     const id = el.dataset.id;
