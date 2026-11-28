@@ -124,6 +124,7 @@ insert into recruit_offers (event_id, game_id, target_id, accepted)
   select event_id, game_id, target_id, accepted from event_results where kind = 'recruit' on conflict do nothing;
 update event_results set kind = 'kill', target_id = null where kind = 'recruit';
 alter table events add column if not exists reminded boolean not null default false;
+alter table events add column if not exists reminded_morning boolean not null default false;
 -- The public who-voted-for-whom text, saved at the reveal so the app and Slack show exactly the same thing.
 -- It is only readable once the event is revealed, through the same policy as the result itself.
 alter table event_results add column if not exists votes text;
@@ -611,15 +612,17 @@ create extension if not exists pg_net;
 
 -- Posts to the Slack webhook the GM saved. Does nothing until one is set. Only hooks.slack.com URLs are
 -- ever called (the database makes the request, so an arbitrary URL would be a server-side request hole).
-create or replace function slack_post(p_text text) returns void language plpgsql security definer set search_path = public as $$
+drop function if exists slack_post(text);
+create or replace function slack_post(p_text text, p_channel boolean default false) returns void language plpgsql security definer set search_path = public as $$
 declare v_url text := (select value from app_config where key = 'slack_webhook');
 begin
   if v_url is null or v_url not like 'https://hooks.slack.com/%' then return; end if;
   -- A failed or unreachable Slack must never stop a round from resolving.
   begin
     perform net.http_post(url := v_url,
-                          -- Names are player-chosen, so neutralise Slack markup like <!channel>.
-                          body := jsonb_build_object('text', replace(replace(replace(p_text, '&', '&amp;'), '<', '&lt;'), '>', '&gt;')),
+                          -- Names are player-chosen, so neutralise Slack markup like <!channel>; only p_channel adds it, after escaping.
+                          body := jsonb_build_object('text', case when p_channel then '<!channel> ' else '' end
+                                    || replace(replace(replace(p_text, '&', '&amp;'), '<', '&lt;'), '>', '&gt;')),
                           headers := '{"Content-Type": "application/json"}'::jsonb);
   exception when others then null;
   end;
@@ -721,7 +724,7 @@ end $$;
 -- Runs close, reveal, then open until nothing moves, so a murder revealed at 13:00 has already taken effect when the
 -- banishment opening at 13:00 counts who is alive (that count decides whether it is the final banishment).
 create or replace function advance_games(p_now timestamptz default now()) returns void language plpgsql security definer set search_path = public as $$
-declare e events; tz text; v_alive int; changed boolean; i int := 0;
+declare e events; tz text; v_alive int; v_names text; changed boolean; i int := 0;
 begin
   -- One run at a time: the cron job, a GM button and the last vote can all arrive together.
   perform pg_advisory_xact_lock(727001);
@@ -789,14 +792,22 @@ begin
     exit when not changed or i >= 50;
   end loop;
 
+  -- Two reminders per banishment vote, at 09:00 on the day it closes and an hour before it closes (people lunch at 12), each
+  -- naming whoever has not voted. If the job is late and both are due, only the closing one is sent.
   for e in select ev.* from events ev join games g on g.id = ev.game_id
-           where g.status = 'active' and ev.status = 'open' and ev.kind = 'banishment' and not ev.reminded and not ev.untimed
-             and ev.closes_at - interval '3 hours' <= p_now and ev.closes_at > p_now
+           where g.status = 'active' and ev.status = 'open' and ev.kind = 'banishment' and not ev.untimed and ev.closes_at > p_now
+             and ((not ev.reminded and ev.closes_at - interval '1 hour' <= p_now)
+               or (not ev.reminded_morning and (date_trunc('day', ev.closes_at at time zone g.tz) + interval '9 hours') at time zone g.tz <= p_now))
            order by ev.closes_at loop
-    update events set reminded = true where id = e.id;
+    update events set reminded_morning = true, reminded = reminded or e.closes_at - interval '1 hour' <= p_now where id = e.id;
     select g.tz into tz from games g where g.id = e.game_id;
-    perform slack_post(format('Reminder: the banishment vote closes %s. If you have not voted yet, now is the time.',
-                              to_char(e.closes_at at time zone tz, 'FMDay "at" HH24:MI')));
+    select string_agg(p.display_name, ', ' order by p.display_name) into v_names from players p
+    where p.game_id = e.game_id and p.alive
+      and not exists (select 1 from actions a where a.event_id = e.id and a.player_id = p.id);
+    if v_names is not null then
+      perform slack_post(format('Reminder: the banishment vote closes %s. Still to vote: %s.',
+                                to_char(e.closes_at at time zone tz, 'FMDay "at" HH24:MI'), v_names), true);
+    end if;
   end loop;
 end $$;
 
@@ -1087,7 +1098,7 @@ begin
     opens_at = case when status = 'scheduled' then opens_at + p_by else opens_at end,
     closes_at = case when status in ('scheduled', 'open') then closes_at + p_by else closes_at end,
     reveals_at = reveals_at + p_by,
-    reminded = false
+    reminded = false, reminded_morning = false
   where game_id = p_game and status in ('scheduled', 'open', 'closed');
 end $$;
 
@@ -1190,7 +1201,7 @@ begin
   perform slack_post('Test message from Traitors. If you can read this, announcements are working.');
 end $$;
 
-revoke execute on function slack_post(text) from public, anon, authenticated;
+revoke execute on function slack_post(text, boolean) from public, anon, authenticated;
 revoke execute on function vote_breakdown(uuid) from public, anon, authenticated;
 revoke execute on function gm_set_slack(text), gm_slack_test() from public, anon;
 grant execute on function gm_set_slack(text), gm_slack_test() to authenticated;

@@ -706,6 +706,12 @@ select gm_set_slack('https://hooks.slack.com/services/T0/B0/X');
 select tests.throws($$select gm_remind('00000000-0000-0000-0000-0000000000a2')$$, 'open banishment', 'cannot remind about a murder window');
 select tests.lives($$select gm_remind('00000000-0000-0000-0000-0000000000a1')$$, 'reminder posts (and never fails the game if Slack is down)');
 select tests.reset();
+-- automatic reminders: nothing days early, both flags set once the closing hour is reached (so only one post goes out)
+update events set reminded = false, reminded_morning = false where id = '00000000-0000-0000-0000-0000000000a1';
+select advance_games((select closes_at - interval '10 days' from events where id = '00000000-0000-0000-0000-0000000000a1'));
+select tests.eq((select reminded or reminded_morning from events where id = '00000000-0000-0000-0000-0000000000a1'), false, 'no reminder days before the close');
+select advance_games((select closes_at - interval '30 minutes' from events where id = '00000000-0000-0000-0000-0000000000a1'));
+select tests.eq((select reminded and reminded_morning from events where id = '00000000-0000-0000-0000-0000000000a1'), true, 'closing reminder marks both reminders as sent');
 insert into actions (event_id, player_id, target_id)
   select '00000000-0000-0000-0000-0000000000a1', p.id, tests.pid(tests.g(), 'a') from players p where p.game_id = tests.g() and p.display_name <> 'a';
 insert into actions (event_id, player_id, target_id) values ('00000000-0000-0000-0000-0000000000a1', tests.pid(tests.g(), 'a'), tests.pid(tests.g(), 'b'));
