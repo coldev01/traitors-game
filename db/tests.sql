@@ -228,14 +228,14 @@ select tests.reset();
 select tests.eq((select count(*) from roles where game_id = tests.g() and role = 'traitor'), 2::bigint, '6 players -> 2 traitors');
 select tests.eq((select count(*) from events where game_id = tests.g()), 48::bigint, '12 weeks x 4 events');
 select tests.eq((select opens_at from events where game_id = tests.g() and kind = 'banishment' order by opens_at limit 1),
-                '2026-10-19 09:00:00+01'::timestamptz, 'first banishment opens Mon 09:00 London');
+                '2026-10-19 13:00:00+01'::timestamptz, 'first banishment opens Mon 13:00 London');
 select tests.eq((select closes_at from events where game_id = tests.g() and kind = 'murder' order by opens_at limit 1),
-                '2026-10-21 00:00:00+01'::timestamptz, 'murder 1 closes Wed 00:00');
+                '2026-10-21 13:00:00+01'::timestamptz, 'murder 1 closes Wed 13:00, the same time it is revealed');
 select tests.eq((select reveals_at from events where game_id = tests.g() and kind = 'murder' order by opens_at limit 1),
-                '2026-10-21 09:00:00+01'::timestamptz, 'murder 1 is revealed Wed 09:00');
-select tests.ok((select bool_and(reveals_at - closes_at >= interval '6 hours') from events where game_id = tests.g() and kind = 'murder'), 'murders reveal at least 6 hours after they close');
+                '2026-10-21 13:00:00+01'::timestamptz, 'murder 1 is revealed Wed 13:00');
+select tests.ok((select bool_and(closes_at = reveals_at) from events where game_id = tests.g() and kind = 'murder'), 'murders reveal when they close, so a recruit can refuse until the reveal');
 select tests.eq((select picks_close_at from events where game_id = tests.g() and kind = 'murder' order by opens_at limit 1),
-                '2026-10-20 14:00:00+01'::timestamptz, 'the traitors must decide by Tue 14:00');
+                '2026-10-20 23:59:00+01'::timestamptz, 'the traitors must decide by the end of Tue');
 select tests.ok((select bool_and(closes_at = reveals_at) from events where game_id = tests.g() and kind = 'banishment'), 'banishments reveal when they close');
 select tests.eq((select count(*) from events where game_id = tests.g() and extract(isodow from opens_at at time zone 'Europe/London') > 4), 0::bigint, 'nothing opens Fri-Sun');
 select tests.eq((select count(*) from events where game_id = tests.g() and (extract(isodow from closes_at at time zone 'Europe/London') > 4 or extract(isodow from reveals_at at time zone 'Europe/London') > 4)), 0::bigint, 'nothing closes or reveals Fri-Sun');
@@ -261,7 +261,7 @@ select tests.lives(format($$select gm_set_player(%L, %L, true)$$, tests.g(), tes
 select start_game(tests.g(), '2026-10-23');
 select tests.reset();
 select tests.eq((select opens_at from events where game_id = tests.g() and kind = 'banishment' order by opens_at limit 1),
-                '2026-10-26 09:00:00+00'::timestamptz, 'a Friday start waits for Monday (clocks went back on the 25th)');
+                '2026-10-26 13:00:00+00'::timestamptz, 'a Friday start waits for Monday (clocks went back on the 25th)');
 rollback to savepoint s2a;
 savepoint s2a2;
 insert into admins values ('gm@org.test');
@@ -272,8 +272,8 @@ select set_config('t.g', create_game()::text, false);
 select tests.lives(format($$select gm_set_player(%L, %L, true)$$, tests.g(), tests.uid('p' || i)), 'select p' || i) from generate_series(1, 6) i;
 select start_game(tests.g());
 select tests.reset();
-select tests.ok((select opens_at > now() and extract(isodow from opens_at at time zone 'Europe/London') <= 4 and extract(hour from opens_at at time zone 'Europe/London') = 9
-                 from events where game_id = tests.g() and kind = 'banishment' order by opens_at limit 1), 'no date: starts at 09:00 on a working day, in the future');
+select tests.ok((select opens_at > now() and extract(isodow from opens_at at time zone 'Europe/London') <= 4 and extract(hour from opens_at at time zone 'Europe/London') = 13
+                 from events where game_id = tests.g() and kind = 'banishment' order by opens_at limit 1), 'no date: starts at 13:00 on a working day, in the future');
 rollback to savepoint s2a2;
 
 -------------------------------------------------------------------- 2b. no upper limit on players
@@ -542,6 +542,24 @@ select advance_games(now() + interval '10 hours 30 minutes');
 select advance_games(now() + interval '11 hours 5 minutes');
 select tests.ok((select target_id is null and kind = 'kill' from murder_locks where event_id = '00000000-0000-0000-0000-0000000000d5'), 'no picks at the deadline locks nobody');
 rollback to savepoint s6c;
+
+-------------------------------------------------------------------- 6c1. no recruiting, so the traitors get the whole window
+savepoint s6c1;
+select set_config('t.g', tests.make_game(9)::text, false);
+select tests.set_traitors(tests.g(), '{a,b,c}');
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status, picks_close_at) values
+  ('00000000-0000-0000-0000-0000000000f1', tests.g(), 'murder', now() - interval '1 minute', now() + interval '20 hours', now() + interval '20 hours', 'scheduled', now() + interval '10 hours');
+select advance_games(now());
+select tests.ok((select status = 'open' and picks_close_at = closes_at from events where id = '00000000-0000-0000-0000-0000000000f1'), '3 traitors: the deadline is the close of the window');
+rollback to savepoint s6c1;
+savepoint s6c1b;
+select set_config('t.g', tests.make_game(9)::text, false);
+select tests.set_traitors(tests.g(), '{a,b}');
+insert into events (id, game_id, kind, opens_at, closes_at, reveals_at, status, picks_close_at) values
+  ('00000000-0000-0000-0000-0000000000f2', tests.g(), 'murder', now() - interval '1 minute', now() + interval '20 hours', now() + interval '20 hours', 'scheduled', now() + interval '10 hours');
+select advance_games(now());
+select tests.ok((select status = 'open' and picks_close_at < closes_at from events where id = '00000000-0000-0000-0000-0000000000f2'), '2 traitors: the early deadline stays, leaving time for a recruit to refuse');
+rollback to savepoint s6c1b;
 
 -------------------------------------------------------------------- 6c2. the GM can give the traitors longer to decide
 savepoint s6c2;

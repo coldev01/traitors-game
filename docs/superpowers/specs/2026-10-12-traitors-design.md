@@ -53,10 +53,10 @@ A round is four working days (Mon to Thu); Fri to Sun are skipped. The game can 
 
 | Event | Opens | Closes | Result shown |
 |---|---|---|---|
-| Banishment 1 | Mon 09:00 | Tue 09:00 | Tue 09:00 |
-| Murder 1 | Tue 09:00 | Wed 09:00 | Wed 09:00 |
-| Banishment 2 | Wed 09:00 | Thu 09:00 | Thu 09:00 |
-| Murder 2 | Thu 09:00 | Mon 09:00 | Mon 09:00 |
+| Banishment 1 | Mon 13:00 | Tue 13:00 | Tue 13:00 |
+| Murder 1 | Tue 13:00 | Wed 13:00 | Wed 13:00 |
+| Banishment 2 | Wed 13:00 | Thu 13:00 | Thu 13:00 |
+| Murder 2 | Thu 13:00 | Mon 13:00 | Mon 13:00 |
 
 Repeats every four working days: two rounds a week, so a 10-player game runs roughly 2–3 weeks. Times live in game config, not code, so the schedule can change (or compress to minutes for dry runs) without code changes.
 
@@ -66,7 +66,7 @@ Banishment and murder are two interleaved tracks, not a single day/night sequenc
 
 - **Fixed times only.** Events resolve at their scheduled time. There is no early finish, so Slack discussion can run until the deadline and nobody is pressured.
 - **Banishment:** most votes is banished. Ties are broken at random among the tied players. Not voting counts as abstaining. Once the result is announced, who voted for whom is published too, in Slack and in the app's "What happened" timeline (the same saved text, so they always match) (only the votes that counted, plus who did not vote, and a note when a tie was broken at random). Skipped rounds publish nothing. The banished player is marked dead and their role is revealed at `reveals_at`.
-- **Murder:** the traitors must choose a victim (or recruit); there is no "no murder" option in the app. Each living traitor suggests a target. As soon as more than half of them name the same person (and the same choice of murder or recruit) it is locked in. The traitors have until 14:00 on the day the window opens; at that deadline the most-suggested choice goes ahead, a tie is settled at random, and no suggestions at all means nobody dies. Nothing the traitors choose is stored where the faithful can read it (`murder_locks` is traitor-only).
+- **Murder:** the traitors must choose a victim (or recruit); there is no "no murder" option in the app. Each living traitor suggests a target. As soon as more than half of them name the same person (and the same choice of murder or recruit) it is locked in. The traitors have until 23:59 on the day the window opens; a recruit then has until the window closes, at the 13:00 reveal, to refuse. That early deadline only applies while recruiting is possible (2 or fewer traitors alive); with more, the traitors get the whole window up to the 13:00 reveal; at that deadline the most-suggested choice goes ahead, a tie is settled at random, and no suggestions at all means nobody dies. Nothing the traitors choose is stored where the faithful can read it (`murder_locks` is traitor-only).
 - **Murder timing:** the victim is chosen at close but only applied (marked dead, role revealed) at `reveals_at`, so the reveal always lands before that day's banishment. A victim who voted before being applied has that vote discarded.
 - **Recruitment:** once 2 or fewer traitors are alive, a suggestion can be a recruit instead of a murder (same majority and deadline rules). When a recruit is locked in the target becomes a traitor at once (role card, traitors chat and traitor view update) and sees a private offer. They can refuse until the murder window closes; refusing turns them faithful again and they are murdered when the window is revealed, shown as faithful. No answer: they stay a traitor and nobody dies. Everyone else sees an ordinary "nobody was murdered" round, unless the recruit refused, which looks like any murder.
 - **Win check** after each applied result: faithful win when all traitors are out; traitors win when they equal or outnumber the faithful.
@@ -114,7 +114,7 @@ Banishment and murder are two interleaved tracks, not a single day/night sequenc
 
 ## Assumptions to confirm
 
-- Nothing opens, closes or posts on Fri to Sun (the team is off alternate Fridays). Every event starts at 09:00 Mon to Thu.
-- Murder 2's window (day 4 09:00 to the next day 1 09:00, so Thu to Mon on a Monday start) deliberately spans the weekend.
+- Nothing opens, closes or posts on Fri to Sun (the team is off alternate Fridays). Every event starts at 13:00 Mon to Thu (09:00 was tried first, but people are in meetings then).
+- Murder 2's window (day 4 13:00 to the next day 1 13:00, so Thu to Mon on a Monday start) deliberately spans the weekend.
 - The org supplies headshots and an `email → photo` mapping.
 - **Reveal stage:** when everyone picks End, or 2 players are left, nothing is announced yet. The game enters a reveal stage: nothing is open or scheduled, and each player still standing presses "Reveal my role" (the GM can reveal anyone, or everyone). Each reveal is shown to everyone and posted to Slack. After the last reveal the winner is announced: the Traitors if any revealed role is a traitor, otherwise the Faithful.

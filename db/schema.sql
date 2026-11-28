@@ -222,9 +222,9 @@ create policy messages_select on messages for select to authenticated using (is_
 create or replace function am_admin() returns boolean language sql stable as $$ select is_admin() $$;
 
 -- Offsets are minutes of WORKING time from the start day's 00:00 (see work_time): a day is 1440 minutes, and Friday to Sunday
--- do not count, so a round is 4 working days = 5760 minutes. In a murder window the traitors must decide by 'lock' (14:00 on
--- the day it opens); a recruit then has until the window closes to refuse. Murder 1 closes at the start of day 3 and murder 2
--- at the start of the next round; nothing opens, closes or locks on a Friday, Saturday or Sunday.
+-- do not count, so a round is 4 working days = 5760 minutes. In a murder window the traitors must decide by 'lock' (23:59 on
+-- the day it opens); a recruit then has until the window closes, which is also when it is revealed, to refuse.
+-- Nothing opens, closes or reveals on a Friday, Saturday or Sunday.
 -- Turns working-time minutes after p_anchor into a local timestamp, skipping Fri-Sun. The anchor must be on Mon-Thu (callers
 -- move it); day 0 is the anchor's day, the next day after a Thursday is the following Monday.
 create or replace function work_time(p_anchor timestamp, p_off int) returns timestamp language sql immutable as $$
@@ -235,13 +235,14 @@ create or replace function work_time(p_anchor timestamp, p_off int) returns time
 $$;
 
 create or replace function default_schedule() returns jsonb language sql immutable as $$
-  -- Votes open and close Mon-Thu 09:00; murders close at midnight and are revealed at 09:00. Never Fri-Sun (the team is off
-  -- alternate Fridays). Started on a Monday, murder 2 spans the weekend.
+  -- Everything opens, closes and reveals Mon-Thu 13:00 (people are in meetings in the morning, and check in at lunch). The
+  -- traitors decide by the end of the day a murder opens, so a recruit has the morning to refuse before the 13:00 reveal.
+  -- Never Fri-Sun (the team is off alternate Fridays). Started on a Monday, murder 2 spans the weekend.
   select jsonb_build_array(
-    jsonb_build_object('kind', 'banishment', 'open', 540,  'close', 1980, 'reveal', 1980),
-    jsonb_build_object('kind', 'murder',     'open', 1980, 'close', 2880, 'reveal', 3420, 'lock', 2280),
-    jsonb_build_object('kind', 'banishment', 'open', 3420, 'close', 4860, 'reveal', 4860),
-    jsonb_build_object('kind', 'murder',     'open', 4860, 'close', 5760, 'reveal', 6300, 'lock', 5160))
+    jsonb_build_object('kind', 'banishment', 'open', 780,  'close', 2220, 'reveal', 2220),
+    jsonb_build_object('kind', 'murder',     'open', 2220, 'close', 3660, 'reveal', 3660, 'lock', 2879),
+    jsonb_build_object('kind', 'banishment', 'open', 3660, 'close', 5100, 'reveal', 5100),
+    jsonb_build_object('kind', 'murder',     'open', 5100, 'close', 6540, 'reveal', 6540, 'lock', 5759))
 $$;
 
 create or replace function create_game() returns uuid language plpgsql security definer set search_path = public as $$
@@ -285,7 +286,7 @@ begin
     from (select id, row_number() over (order by random()) rn from players where game_id = p_game) s;
   end if;
 
-  -- With no date the game starts tomorrow at 00:00 (first banishment 09:00), or the next Monday if tomorrow is Fri-Sun.
+  -- With no date the game starts tomorrow at 00:00 (first banishment 13:00), or the next Monday if tomorrow is Fri-Sun.
   -- A given date that falls on Fri-Sun moves to the next Monday so day 0 is always a working day.
   v_anchor := coalesce(p_anchor, date_trunc('day', now() at time zone g.tz) + interval '1 day');
   if extract(isodow from v_anchor) > 4 then v_anchor := v_anchor + make_interval(days => 8 - extract(isodow from v_anchor)::int); end if;
@@ -717,8 +718,8 @@ begin
   end if;
 end $$;
 
--- Runs close, reveal, then open until nothing moves, so a murder revealed at 09:00 has already taken effect when the
--- banishment opening at 09:00 counts who is alive (that count decides whether it is the final banishment).
+-- Runs close, reveal, then open until nothing moves, so a murder revealed at 13:00 has already taken effect when the
+-- banishment opening at 13:00 counts who is alive (that count decides whether it is the final banishment).
 create or replace function advance_games(p_now timestamptz default now()) returns void language plpgsql security definer set search_path = public as $$
 declare e events; tz text; v_alive int; changed boolean; i int := 0;
 begin
@@ -771,6 +772,11 @@ begin
         perform slack_post('The final banishment vote is open. There is no deadline: it closes when everyone has voted. Roles are no longer revealed.');
       else
         update events set status = 'open' where id = e.id;
+        -- Beyond 2 traitors nobody can be recruited, so nobody needs the morning to refuse and the traitors get the whole window.
+        if e.kind = 'murder' and (select count(*) from players p join roles r on r.player_id = p.id
+                                  where p.game_id = e.game_id and p.alive and r.role = 'traitor') > 2 then
+          update events set picks_close_at = closes_at where id = e.id;
+        end if;
         -- Murder windows are the traitors' business, so only banishment votes are announced.
         if e.kind = 'banishment' then
           perform slack_post(format('The banishment vote is open. It closes %s. Not voting counts as abstaining.',
